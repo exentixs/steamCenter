@@ -30,7 +30,7 @@
 * **Интерфейс:** WPF (Windows Presentation Foundation)
 * **Язык:** C# 14.0
 * **Взаимодействие со Steam:** Прямая правка реестра Windows (`RegistryKey`) и манипуляция файлами конфигурации VDF.
-* <img width="1046" height="794" alt="image" src="https://github.com/user-attachments/assets/d0c3a66d-9f6d-400a-afaf-1c2f6cff50af" />
+* 
 
 
 ---
