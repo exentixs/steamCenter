@@ -109,135 +109,58 @@ namespace steamCenter
             }
         }
 
-        /// <summary>
-        /// Прямой парсер для формата VDF Steam (без кавычек вокруг ID пользователей)
-        /// </summary>
-        private List<Dictionary<string, string>> ParseLoginUsersVdf(string content)
-        {
-            var accounts = new List<Dictionary<string, string>>();
-            var lines = content.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
-
-            int i = 0;
-            while (i < lines.Length)
-            {
-                string line = lines[i].Trim();
-
-                // Пропускаем "users" и "{"
-                if (line == "\"users\"" || line == "users" || line == "{")
-                {
-                    i++;
-                    continue;
-                }
-
-                // Закрывающая скобка в конце
-                if (line == "}")
-                {
-                    i++;
-                    continue;
-                }
-
-                // Ищем ID пользователя (цифры, может быть в кавычках или без)
-                string userId = "";
-                if (line.StartsWith("\"") && line.EndsWith("\""))
-                {
-                    userId = line.Trim('"');
-                }
-                else if (Regex.IsMatch(line, @"^\d+$"))
-                {
-                    userId = line;
-                }
-
-                if (!string.IsNullOrEmpty(userId) && Regex.IsMatch(userId, @"^\d+$"))
-                {
-                    var accountData = new Dictionary<string, string>();
-                    accountData["SteamId"] = userId;
-
-                    i++; // Переходим к следующей строке (должна быть "{")
-
-                    if (i < lines.Length && lines[i].Trim() == "{")
-                    {
-                        i++;
-                        // Читаем свойства до "}"
-                        while (i < lines.Length)
-                        {
-                            string propLine = lines[i].Trim();
-                            if (propLine == "}")
-                            {
-                                break;
-                            }
-
-                            if (!string.IsNullOrEmpty(propLine))
-                            {
-                                // Парсим "Key" "Value" или "Key" "Value" с табуляцией
-                                var match = Regex.Match(propLine, "\"([^\"]+)\"\\s+\"([^\"]*)\"");
-                                if (match.Success)
-                                {
-                                    string key = match.Groups[1].Value;
-                                    string value = match.Groups[2].Value;
-                                    accountData[key] = value;
-                                }
-                            }
-                            i++;
-                        }
-                    }
-
-                    if (accountData.ContainsKey("AccountName"))
-                    {
-                        accounts.Add(accountData);
-                        _logger.Info($"Найден аккаунт: {accountData["AccountName"]} ({accountData.GetValueOrDefault("PersonaName", "Unknown")})");
-                    }
-                }
-                i++;
-            }
-
-            return accounts;
-        }
-
         private async Task LoadSteamAccounts()
         {
             var vdfPath = Path.Combine(_steamPath, "config", "loginusers.vdf");
 
             if (!File.Exists(vdfPath))
             {
-                MessageBox.Show($"loginusers.vdf не найден:\n{vdfPath}\n\nУбедитесь, что Steam установлен.",
-                               "Ошибка", MessageBoxButton.OK, MessageBoxImage.Error);
+                MessageBox.Show($"loginusers.vdf не найден:\n{vdfPath}", "Ошибка",
+                               MessageBoxButton.OK, MessageBoxImage.Error);
                 return;
             }
 
             try
             {
-                // Снимаем атрибут "Только чтение" если он есть
                 var fileInfo = new FileInfo(vdfPath);
                 if (fileInfo.IsReadOnly)
                 {
-                    _logger.Info($"Снимаем атрибут 'Только чтение' с файла {vdfPath}");
                     fileInfo.IsReadOnly = false;
                 }
 
-                // Читаем файл с правильной кодировкой
                 string content = File.ReadAllText(vdfPath, Encoding.UTF8);
                 _logger.Info($"Файл loginusers.vdf загружен, размер: {content.Length} байт");
 
-                // Парсим файл
-                var parsedAccounts = ParseLoginUsersVdf(content);
-                _logger.Info($"Найдено пользователей: {parsedAccounts.Count}");
+                // Парсим через регулярные выражения для надежности
+                var accountMatches = Regex.Matches(content, @"(""\d{17}"")\s*\{([^}]+)\}", RegexOptions.Singleline);
+                _logger.Info($"Найдено блоков аккаунтов: {accountMatches.Count}");
 
                 var favorites = LoadFavorites();
                 _accounts.Clear();
 
-                foreach (var accountData in parsedAccounts)
+                foreach (Match match in accountMatches)
                 {
                     try
                     {
-                        var steamId = accountData.GetValueOrDefault("SteamId", "");
-                        var accountName = accountData.GetValueOrDefault("AccountName", "Unknown");
-                        var personaName = accountData.GetValueOrDefault("PersonaName", "Unknown");
+                        string steamId = match.Groups[1].Value.Trim('"');
+                        string blockContent = match.Groups[2].Value;
 
+                        // Извлекаем AccountName
+                        var nameMatch = Regex.Match(blockContent, @"""AccountName""\s*""([^""]+)""", RegexOptions.IgnoreCase);
+                        if (!nameMatch.Success) continue;
+
+                        string accountName = nameMatch.Groups[1].Value;
+
+                        // Извлекаем PersonaName
+                        var personaMatch = Regex.Match(blockContent, @"""PersonaName""\s*""([^""]+)""", RegexOptions.IgnoreCase);
+                        string personaName = personaMatch.Success ? personaMatch.Groups[1].Value : accountName;
+
+                        // Извлекаем Timestamp
                         DateTime lastLogin = DateTime.MinValue;
-                        if (accountData.TryGetValue("Timestamp", out string? timestampStr) && !string.IsNullOrEmpty(timestampStr))
+                        var timestampMatch = Regex.Match(blockContent, @"""Timestamp""\s*""([^""]+)""", RegexOptions.IgnoreCase);
+                        if (timestampMatch.Success && long.TryParse(timestampMatch.Groups[1].Value, out long timestamp) && timestamp > 0)
                         {
-                            if (long.TryParse(timestampStr, out long timestamp) && timestamp > 0)
-                                lastLogin = DateTimeOffset.FromUnixTimeSeconds(timestamp).DateTime;
+                            lastLogin = DateTimeOffset.FromUnixTimeSeconds(timestamp).DateTime;
                         }
 
                         var hasPassword = _credentials.HasAccount(accountName);
@@ -284,26 +207,14 @@ namespace steamCenter
 
                 if (_accounts.Count == 0)
                 {
-                    MessageBox.Show($"Не удалось найти аккаунты в файле:\n{vdfPath}\n\n" +
-                                   "Возможно, файл поврежден.\n\n" +
-                                   "Попробуйте:\n" +
-                                   "1. Закрыть Steam\n" +
-                                   "2. Удалить файл loginusers.vdf\n" +
-                                   "3. Запустить Steam и войти в аккаунт\n" +
-                                   "4. Запустить приложение снова",
-                                   "Предупреждение", MessageBoxButton.OK, MessageBoxImage.Warning);
-                }
-                else
-                {
-                    _logger.Info($"Успешно загружено {_accounts.Count} аккаунтов");
+                    _logger.Warning("Аккаунты не найдены в loginusers.vdf");
                 }
             }
             catch (Exception ex)
             {
                 _logger.Error("Ошибка загрузки Steam аккаунтов", ex);
-                MessageBox.Show($"Ошибка загрузки Steam аккаунтов:\n{ex.Message}\n\n" +
-                               $"Путь: {vdfPath}",
-                               "Ошибка", MessageBoxButton.OK, MessageBoxImage.Error);
+                MessageBox.Show($"Ошибка загрузки Steam аккаунтов:\n{ex.Message}", "Ошибка",
+                               MessageBoxButton.OK, MessageBoxImage.Error);
             }
         }
 
@@ -523,14 +434,15 @@ namespace steamCenter
             Grid.SetColumn(configPanel, 3);
             grid.Children.Add(configPanel);
 
+            // В Tag передаем ТОЛЬКО логин (строку), а не весь объект!
             var loginBtn = new Button
             {
                 Content = "ВОЙТИ",
                 Style = (Style)FindResource("LoginButton"),
                 Margin = new Thickness(5, 0, 10, 0),
-                Tag = account
+                Tag = account.AccountName
             };
-            loginBtn.Click += (s, e) => LoginAccount(account);
+            loginBtn.Click += LoginButton_Click;
 
             Grid.SetColumn(loginBtn, 4);
             grid.Children.Add(loginBtn);
@@ -640,24 +552,19 @@ namespace steamCenter
         }
 
         /// <summary>
-        /// Остановка всех процессов Steam
+        /// Безопасное закрытие Steam через команду -shutdown
         /// </summary>
-        private void KillSteamProcesses()
+        private void ShutdownSteamGracefully()
         {
             try
             {
-                foreach (var process in Process.GetProcessesByName("steam"))
+                if (Process.GetProcessesByName("steam").Length > 0)
                 {
-                    try
-                    {
-                        process.Kill();
-                        process.WaitForExit(5000);
-                        _logger.Info($"Процесс Steam убит (PID: {process.Id})");
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.Error($"Ошибка убийства Steam процесса {process.Id}", ex);
-                    }
+                    _logger.Info("Отправляем команду -shutdown в Steam");
+                    var shutdownProc = Process.Start(Path.Combine(_steamPath, "steam.exe"), "-shutdown");
+                    shutdownProc?.WaitForExit(10000);
+                    Thread.Sleep(2000);
+                    _logger.Info("Steam получил команду на закрытие");
                 }
 
                 foreach (var process in Process.GetProcessesByName("steamwebhelper"))
@@ -665,103 +572,124 @@ namespace steamCenter
                     try
                     {
                         process.Kill();
-                        _logger.Info($"Процесс steamwebhelper убит (PID: {process.Id})");
                     }
-                    catch (Exception ex)
-                    {
-                        _logger.Error($"Ошибка убийства steamwebhelper процесса {process.Id}", ex);
-                    }
+                    catch { }
                 }
-
-                // Даем время процессам завершиться
-                Thread.Sleep(2000);
             }
             catch (Exception ex)
             {
-                _logger.Error("Ошибка при остановке процессов Steam", ex);
+                _logger.Error("Ошибка при закрытии Steam", ex);
             }
         }
 
         /// <summary>
-        /// Обновление файла loginusers.vdf - устанавливаем MostRecent для нужного аккаунта
+        /// Безопасное обновление файла loginusers.vdf
         /// </summary>
         private void UpdateLoginUsersVdf(string targetLogin)
         {
             string vdfPath = Path.Combine(_steamPath, "config", "loginusers.vdf");
             if (!File.Exists(vdfPath))
             {
-                _logger.Warning($"Файл loginusers.vdf не найден: {vdfPath}");
+                _logger.Warning("Файл loginusers.vdf не найден.");
                 return;
             }
 
             try
             {
-                // Снимаем атрибут "Только чтение"
-                var fileInfo = new FileInfo(vdfPath);
-                if (fileInfo.IsReadOnly)
-                {
-                    fileInfo.IsReadOnly = false;
-                    _logger.Info("Снят атрибут 'Только чтение' с loginusers.vdf");
-                }
+                // Читаем все строки файла, чтобы не нарушать его кодировку и структуру
+                List<string> lines = File.ReadAllLines(vdfPath, Encoding.UTF8).ToList();
 
-                string[] lines = File.ReadAllLines(vdfPath, Encoding.UTF8);
-                int currentBlockStartIndex = -1;
-                int targetBlockStartIndex = -1;
+                string targetLower = targetLogin.Trim().ToLower();
 
-                // Первый проход: ищем SteamID аккаунта с нужным логином
-                for (int i = 0; i < lines.Length; i++)
+                int currentAccountStartIndex = -1;
+                int targetAccountStartIndex = -1;
+
+                // ШАГ 1: Находим, в каком месте файла лежит именно наш аккаунт
+                for (int i = 0; i < lines.Count; i++)
                 {
                     string line = lines[i].Trim();
 
-                    // Каждый аккаунт начинается со строки SteamID64 (начинается с цифр и может быть в кавычках)
-                    if ((line.StartsWith("\"7656") || Regex.IsMatch(line, @"^\d+$")) && i + 1 < lines.Length && lines[i + 1].Contains("{"))
+                    // Если строка — это SteamID64 (начинается на "7656...")
+                    if (line.StartsWith("\"7656") && i + 1 < lines.Count && lines[i + 1].Contains("{"))
                     {
-                        currentBlockStartIndex = i;
+                        currentAccountStartIndex = i;
                     }
 
-                    // Если внутри этого блока нашли наш логин (без учета регистра)
-                    if (line.Contains("AccountName") && line.ToLower().Contains(targetLogin.ToLower()))
+                    // Ищем AccountName целевого аккаунта
+                    if (line.StartsWith("\"AccountName\"", StringComparison.OrdinalIgnoreCase))
                     {
-                        targetBlockStartIndex = currentBlockStartIndex;
-                        _logger.Info($"Найден блок аккаунта для {targetLogin} на индексе {targetBlockStartIndex}");
-                    }
-                }
-
-                // Второй проход: устанавливаем MostRecent
-                currentBlockStartIndex = -1;
-                for (int i = 0; i < lines.Length; i++)
-                {
-                    string line = lines[i].Trim();
-
-                    if ((line.StartsWith("\"7656") || Regex.IsMatch(line, @"^\d+$")) && i + 1 < lines.Length && lines[i + 1].Contains("{"))
-                    {
-                        currentBlockStartIndex = i;
-                    }
-
-                    if (line.Contains("MostRecent"))
-                    {
-                        if (currentBlockStartIndex == targetBlockStartIndex && targetBlockStartIndex != -1)
+                        // Извлекаем значение между кавычками
+                        var matches = Regex.Matches(line, @"""([^""]+)""");
+                        if (matches.Count >= 2)
                         {
-                            // Наш целевой аккаунт делаем самым активным
-                            lines[i] = Regex.Replace(lines[i], "\"MostRecent\"\\s+\"\\d+\"", "\"MostRecent\"\t\t\"1\"");
-                            _logger.Info($"Установлен MostRecent=1 для аккаунта {targetLogin}");
-                        }
-                        else if (currentBlockStartIndex != -1)
-                        {
-                            // У остальных аккаунтов сбрасываем флаг
-                            lines[i] = Regex.Replace(lines[i], "\"MostRecent\"\\s+\"\\d+\"", "\"MostRecent\"\t\t\"0\"");
+                            string accountInFile = matches[1].Groups[1].Value.Trim().ToLower();
+                            if (accountInFile == targetLower)
+                            {
+                                targetAccountStartIndex = currentAccountStartIndex;
+                                _logger.Info($"Найден аккаунт: {accountInFile} на строке {i}");
+                            }
                         }
                     }
                 }
 
-                // Сохраняем изменения
+                if (targetAccountStartIndex == -1)
+                {
+                    _logger.Warning($"Логин '{targetLogin}' не найден в loginusers.vdf.");
+                    return;
+                }
+
+                // ШАГ 2: Проходим по файлу и точечно меняем только значения флагов 0 и 1
+                currentAccountStartIndex = -1;
+                for (int i = 0; i < lines.Count; i++)
+                {
+                    string line = lines[i].Trim();
+
+                    if (line.StartsWith("\"7656") && i + 1 < lines.Count && lines[i + 1].Contains("{"))
+                    {
+                        currentAccountStartIndex = i;
+                    }
+
+                    // Меняем MostRecent (самый последний запущенный аккаунт)
+                    if (line.StartsWith("\"MostRecent\"", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (currentAccountStartIndex == targetAccountStartIndex)
+                        {
+                            lines[i] = lines[i].Replace("\"0\"", "\"1\"");
+                            _logger.Info($"Установлен MostRecent=1 для {targetLogin}");
+                        }
+                        else if (currentAccountStartIndex != -1)
+                        {
+                            lines[i] = lines[i].Replace("\"1\"", "\"0\"");
+                        }
+                    }
+
+                    // Для нашего целевого аккаунта принудительно включаем сохранение пароля
+                    if (line.StartsWith("\"RememberPassword\"", StringComparison.OrdinalIgnoreCase) && currentAccountStartIndex == targetAccountStartIndex)
+                    {
+                        lines[i] = lines[i].Replace("\"0\"", "\"1\"");
+                        _logger.Info($"Установлен RememberPassword=1 для {targetLogin}");
+                    }
+
+                    // Выключаем автономный режим, чтобы Стим не ругался на отсутствие сети
+                    if (line.StartsWith("\"WantsOfflineMode\"", StringComparison.OrdinalIgnoreCase) && currentAccountStartIndex == targetAccountStartIndex)
+                    {
+                        lines[i] = lines[i].Replace("\"1\"", "\"0\"");
+                    }
+
+                    // Включаем автоматический вход
+                    if (line.StartsWith("\"AllowAutoLogin\"", StringComparison.OrdinalIgnoreCase) && currentAccountStartIndex == targetAccountStartIndex)
+                    {
+                        lines[i] = lines[i].Replace("\"0\"", "\"1\"");
+                    }
+                }
+
+                // Записываем чистые строки обратно в файл
                 File.WriteAllLines(vdfPath, lines, Encoding.UTF8);
-                _logger.Info("Файл loginusers.vdf успешно обновлен");
+                _logger.Info($"Файл loginusers.vdf успешно обновлен для: {targetLogin}");
             }
             catch (Exception ex)
             {
-                _logger.Error("Ошибка обновления loginusers.vdf", ex);
-                // Не выбрасываем исключение, чтобы продолжить работу даже если VDF не обновился
+                _logger.Error("Ошибка при безопасном редактировании файла loginusers.vdf", ex);
             }
         }
 
@@ -780,21 +708,16 @@ namespace steamCenter
                         key.SetValue("RememberPassword", 1, RegistryValueKind.DWord);
                         _logger.Info($"Установлен AutoLoginUser: {accountName}");
                     }
-                    else
-                    {
-                        _logger.Warning("Ключ реестра Steam не найден");
-                    }
                 }
             }
             catch (Exception ex)
             {
                 _logger.Error("Ошибка записи в реестр", ex);
-                throw;
             }
         }
 
         /// <summary>
-        /// Запуск Steam без аргументов
+        /// Запуск Steam БЕЗ аргументов -login
         /// </summary>
         private void StartSteam()
         {
@@ -806,13 +729,11 @@ namespace steamCenter
                     throw new FileNotFoundException($"steam.exe не найден по пути: {steamExe}");
                 }
 
-                var processInfo = new ProcessStartInfo
+                Process.Start(new ProcessStartInfo
                 {
                     FileName = steamExe,
                     UseShellExecute = true
-                };
-
-                Process.Start(processInfo);
+                });
                 _logger.Info($"Steam запущен: {steamExe}");
             }
             catch (Exception ex)
@@ -823,62 +744,61 @@ namespace steamCenter
         }
 
         /// <summary>
-        /// Бесшовный вход в аккаунт через реестр и VDF файл
+        /// Главный метод входа в аккаунт
         /// </summary>
-        private void LoginAccount(SteamAccount account)
+        private void LoginButton_Click(object sender, RoutedEventArgs e)
         {
+            if (sender is not Button btn || btn.Tag == null) return;
+
+            string accountName = btn.Tag.ToString();
+            _logger.Info($"Попытка входа в аккаунт: {accountName}");
+
             try
             {
-                _logger.Info($"Попытка входа в аккаунт: {account.AccountName}");
-
-                // 1. Копируем пароль в буфер обмена (на всякий случай, если токен слетит)
-                var password = _credentials.GetPassword(account.AccountName);
+                // 1. Копируем пароль в буфер обмена (на всякий случай)
+                var password = _credentials.GetPassword(accountName);
                 if (!string.IsNullOrEmpty(password))
                 {
-                    try
-                    {
-                        Clipboard.SetText(password);
-                        _logger.Info("Пароль скопирован в буфер обмена");
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.Error("Ошибка копирования пароля в буфер", ex);
-                    }
+                    try { Clipboard.SetText(password); } catch { }
                 }
 
                 // 2. Обновляем статус
                 StatusLabel.Text = "Закрытие Steam...";
 
-                // 3. Останавливаем все процессы Steam
-                KillSteamProcesses();
+                // 3. Безопасно закрываем Steam
+                ShutdownSteamGracefully();
 
-                // 4. Обновляем VDF файл (устанавливаем MostRecent)
+                // 4. Обновляем VDF файл
                 StatusLabel.Text = "Обновление конфигурации Steam...";
-                UpdateLoginUsersVdf(account.AccountName);
+                UpdateLoginUsersVdf(accountName);
 
                 // 5. Устанавливаем AutoLoginUser в реестре
                 StatusLabel.Text = "Настройка автоматического входа...";
-                SetAutoLoginUser(account.AccountName);
+                SetAutoLoginUser(accountName);
 
-                // 6. Запускаем Steam без аргументов
+                // 6. Запускаем Steam БЕЗ ПАРАМЕТРОВ -login!
                 StatusLabel.Text = "Запуск Steam...";
                 StartSteam();
 
                 // 7. Обновляем время последнего входа
-                account.LastLogin = DateTime.Now;
+                var account = _accounts.FirstOrDefault(a => a.AccountName == accountName);
+                if (account != null)
+                {
+                    account.LastLogin = DateTime.Now;
+                }
 
                 // 8. Показываем уведомление
-                ShowNotification($"Вход в {account.AccountName} выполнен успешно!");
+                ShowNotification($"Вход в {accountName} выполнен!");
 
-                // 9. Обновляем список (чтобы показать новое время)
+                // 9. Обновляем список
                 UpdateAccountsList();
 
-                StatusLabel.Text = $"Steam запущен с аккаунтом: {account.AccountName}";
-                _logger.Info($"Успешный вход в аккаунт: {account.AccountName}");
+                StatusLabel.Text = $"Steam запущен с аккаунтом: {accountName}";
+                _logger.Info($"Успешный вход в аккаунт: {accountName}");
             }
             catch (Exception ex)
             {
-                _logger.Error($"Ошибка входа в аккаунт {account.AccountName}", ex);
+                _logger.Error($"Ошибка входа в аккаунт {accountName}", ex);
                 MessageBox.Show($"Ошибка входа: {ex.Message}", "Ошибка",
                                MessageBoxButton.OK, MessageBoxImage.Error);
                 StatusLabel.Text = "Ошибка входа";
@@ -1070,7 +990,7 @@ namespace steamCenter
                 }
 
                 _logger.Info($"Скопированы конфиги из {sourceId} в {targetId}");
-                ShowNotification($"Конфиги скопированы в {targetId}");
+                ShowNotification($"Конфиги скопированы");
             }
             catch (Exception ex)
             {
