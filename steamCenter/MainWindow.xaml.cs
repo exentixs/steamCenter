@@ -530,7 +530,7 @@ namespace steamCenter
                 Margin = new Thickness(5, 0, 10, 0),
                 Tag = account
             };
-            loginBtn.Click += async (s, e) => await LoginAccount(account);
+            loginBtn.Click += (s, e) => LoginAccount(account);
 
             Grid.SetColumn(loginBtn, 4);
             grid.Children.Add(loginBtn);
@@ -639,186 +639,163 @@ namespace steamCenter
             }
         }
 
-        private bool ShutdownSteam()
+        /// <summary>
+        /// Остановка всех процессов Steam
+        /// </summary>
+        private void KillSteamProcesses()
         {
             try
             {
                 foreach (var process in Process.GetProcessesByName("steam"))
-                    process.Kill();
-                foreach (var process in Process.GetProcessesByName("steamwebhelper"))
-                    process.Kill();
-
-                for (int i = 0; i < 30; i++)
                 {
-                    if (Process.GetProcessesByName("steam").Length == 0)
-                        return true;
-                    Thread.Sleep(1000);
+                    try
+                    {
+                        process.Kill();
+                        process.WaitForExit(5000);
+                        _logger.Info($"Процесс Steam убит (PID: {process.Id})");
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.Error($"Ошибка убийства Steam процесса {process.Id}", ex);
+                    }
                 }
-                return true;
+
+                foreach (var process in Process.GetProcessesByName("steamwebhelper"))
+                {
+                    try
+                    {
+                        process.Kill();
+                        _logger.Info($"Процесс steamwebhelper убит (PID: {process.Id})");
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.Error($"Ошибка убийства steamwebhelper процесса {process.Id}", ex);
+                    }
+                }
+
+                // Даем время процессам завершиться
+                Thread.Sleep(2000);
             }
             catch (Exception ex)
             {
-                _logger.Error("Ошибка закрытия Steam", ex);
-                return false;
+                _logger.Error("Ошибка при остановке процессов Steam", ex);
             }
         }
 
-        private void SetAutoLogin(string accountName)
+        /// <summary>
+        /// Установка AutoLoginUser в реестре для бесшовного входа
+        /// </summary>
+        private void SetAutoLoginUser(string accountName)
         {
             try
             {
-                var vdfPath = Path.Combine(_steamPath, "config", "loginusers.vdf");
-                if (!File.Exists(vdfPath)) return;
-
-                var content = File.ReadAllText(vdfPath, Encoding.UTF8);
-                var lines = content.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries).ToList();
-
-                // Сбрасываем MostRecent для всех
-                for (int i = 0; i < lines.Count; i++)
-                {
-                    if (lines[i].Contains("MostRecent"))
-                    {
-                        lines[i] = Regex.Replace(lines[i], "\"MostRecent\"\\s+\"\\d\"", "\"MostRecent\"\t\t\"0\"");
-                    }
-                }
-
-                // Устанавливаем MostRecent = 1 для нужного аккаунта
-                bool inUserSection = false;
-
-                for (int i = 0; i < lines.Count; i++)
-                {
-                    string line = lines[i].Trim();
-
-                    // Начало секции пользователя (цифровой ID)
-                    if (line.StartsWith("\"") && Regex.IsMatch(line.Trim('"'), @"^\d+$"))
-                    {
-                        inUserSection = true;
-                    }
-                    else if (inUserSection && line.Contains("AccountName") && line.Contains(accountName))
-                    {
-                        // Нашли нужного пользователя, ищем MostRecent
-                        for (int j = i; j < lines.Count && lines[j].Trim() != "}"; j++)
-                        {
-                            if (lines[j].Contains("MostRecent"))
-                            {
-                                lines[j] = "\t\t\"MostRecent\"\t\t\"1\"";
-                                break;
-                            }
-                        }
-                        break;
-                    }
-                    else if (inUserSection && line == "}")
-                    {
-                        inUserSection = false;
-                    }
-                }
-
-                File.WriteAllText(vdfPath, string.Join(Environment.NewLine, lines), Encoding.UTF8);
-
                 using (var key = Registry.CurrentUser.OpenSubKey(@"Software\Valve\Steam", true))
                 {
                     if (key != null)
                     {
                         key.SetValue("AutoLoginUser", accountName, RegistryValueKind.String);
                         key.SetValue("RememberPassword", 1, RegistryValueKind.DWord);
+                        _logger.Info($"Установлен AutoLoginUser: {accountName}");
                     }
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.Error("Ошибка установки автовхода", ex);
-            }
-        }
-
-        private void CopyConfigurations(string sourceId, string targetId)
-        {
-            try
-            {
-                var src = Path.Combine(_steamPath, "userdata", sourceId);
-                var dst = Path.Combine(_steamPath, "userdata", targetId);
-
-                if (!Directory.Exists(src))
-                {
-                    _logger.Warning($"Исходная папка конфигов не найдена: {src}");
-                    return;
-                }
-
-                Directory.CreateDirectory(dst);
-
-                var allowedExtensions = new[] { ".vdf", ".cfg", ".txt" };
-                var allowedFolders = new[] { "config", "remote" };
-
-                foreach (var file in Directory.GetFiles(src, "*", SearchOption.AllDirectories))
-                {
-                    var ext = Path.GetExtension(file).ToLower();
-                    var relativePath = Path.GetRelativePath(src, file);
-
-                    if (allowedExtensions.Contains(ext) && allowedFolders.Any(f => relativePath.StartsWith(f)))
+                    else
                     {
-                        var targetFile = file.Replace(src, dst);
-                        var targetDir = Path.GetDirectoryName(targetFile);
-                        if (!string.IsNullOrEmpty(targetDir)) Directory.CreateDirectory(targetDir);
-                        File.Copy(file, targetFile, true);
+                        _logger.Warning("Ключ реестра Steam не найден");
                     }
                 }
-
-                _logger.Info($"Скопированы конфиги из {sourceId} в {targetId}");
             }
             catch (Exception ex)
             {
-                _logger.Error($"Ошибка копирования конфигов из {sourceId} в {targetId}", ex);
+                _logger.Error("Ошибка записи в реестр", ex);
                 throw;
             }
         }
 
-        private async Task LoginAccount(SteamAccount account)
+        /// <summary>
+        /// Запуск Steam без аргументов (он сам прочитает реестр)
+        /// </summary>
+        private void StartSteam()
         {
             try
             {
-                var hasPassword = !string.IsNullOrEmpty(_credentials.GetPassword(account.AccountName));
-                var skipPrompt = _credentials.GetSkipPasswordPrompt(account.AccountName);
-
-                if (!hasPassword && !skipPrompt)
-                {
-                    var dialog = new PasswordInputDialog(account.AccountName);
-                    dialog.Owner = this;
-                    if (dialog.ShowDialog() == true)
-                    {
-                        _credentials.SetPassword(account.AccountName, dialog.Password);
-                        _credentials.Save();
-                        hasPassword = true;
-                    }
-                    else return;
-                }
-
-                if (!hasPassword) return;
-
-                StatusLabel.Text = "Закрытие Steam...";
-
-                if (!ShutdownSteam())
-                {
-                    MessageBox.Show("Steam не закрылся", "Ошибка", MessageBoxButton.OK, MessageBoxImage.Error);
-                    return;
-                }
-
-                StatusLabel.Text = "Подготовка входа...";
-                SetAutoLogin(account.AccountName);
-
-                await Task.Delay(1500);
-
                 var steamExe = Path.Combine(_steamPath, "steam.exe");
-                Process.Start(steamExe);
+                if (!File.Exists(steamExe))
+                {
+                    throw new FileNotFoundException($"steam.exe не найден по пути: {steamExe}");
+                }
 
-                StatusLabel.Text = $"Вход: {account.AccountName}";
-                ShowNotification($"Вход в {account.AccountName}");
+                var processInfo = new ProcessStartInfo
+                {
+                    FileName = steamExe,
+                    UseShellExecute = true,
+                    Verb = "runas" // Запуск с правами администратора если нужно
+                };
 
-                account.LastLogin = DateTime.Now;
-                await LoadAllData();
+                Process.Start(processInfo);
+                _logger.Info($"Steam запущен: {steamExe}");
             }
             catch (Exception ex)
             {
-                _logger.Error("Ошибка входа", ex);
-                MessageBox.Show(ex.Message, "Ошибка", MessageBoxButton.OK, MessageBoxImage.Error);
+                _logger.Error("Ошибка запуска Steam", ex);
+                throw;
+            }
+        }
+
+        /// <summary>
+        /// Бесшовный вход в аккаунт через реестр (без окон Steam)
+        /// </summary>
+        private void LoginAccount(SteamAccount account)
+        {
+            try
+            {
+                _logger.Info($"Попытка входа в аккаунт: {account.AccountName}");
+
+                // 1. Копируем пароль в буфер обмена (на всякий случай, если токен слетит)
+                var password = _credentials.GetPassword(account.AccountName);
+                if (!string.IsNullOrEmpty(password))
+                {
+                    try
+                    {
+                        Clipboard.SetText(password);
+                        _logger.Info("Пароль скопирован в буфер обмена");
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.Error("Ошибка копирования пароля в буфер", ex);
+                    }
+                }
+
+                // 2. Обновляем статус
+                StatusLabel.Text = "Закрытие Steam...";
+
+                // 3. Останавливаем все процессы Steam
+                KillSteamProcesses();
+
+                // 4. Устанавливаем AutoLoginUser в реестре
+                StatusLabel.Text = "Настройка автоматического входа...";
+                SetAutoLoginUser(account.AccountName);
+
+                // 5. Запускаем Steam без аргументов
+                StatusLabel.Text = "Запуск Steam...";
+                StartSteam();
+
+                // 6. Обновляем время последнего входа
+                account.LastLogin = DateTime.Now;
+
+                // 7. Показываем уведомление
+                ShowNotification($"Вход в {account.AccountName} выполнен успешно!");
+
+                // 8. Обновляем список (чтобы показать новое время)
+                UpdateAccountsList();
+
+                StatusLabel.Text = $"Steam запущен с аккаунтом: {account.AccountName}";
+                _logger.Info($"Успешный вход в аккаунт: {account.AccountName}");
+            }
+            catch (Exception ex)
+            {
+                _logger.Error($"Ошибка входа в аккаунт {account.AccountName}", ex);
+                MessageBox.Show($"Ошибка входа: {ex.Message}", "Ошибка",
+                               MessageBoxButton.OK, MessageBoxImage.Error);
+                StatusLabel.Text = "Ошибка входа";
             }
         }
 
@@ -971,6 +948,48 @@ namespace steamCenter
             {
                 MessageBox.Show($"Ошибка копирования: {ex.Message}", "Ошибка",
                                MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+
+        private void CopyConfigurations(string sourceId, string targetId)
+        {
+            try
+            {
+                var src = Path.Combine(_steamPath, "userdata", sourceId);
+                var dst = Path.Combine(_steamPath, "userdata", targetId);
+
+                if (!Directory.Exists(src))
+                {
+                    _logger.Warning($"Исходная папка конфигов не найдена: {src}");
+                    return;
+                }
+
+                Directory.CreateDirectory(dst);
+
+                var allowedExtensions = new[] { ".vdf", ".cfg", ".txt" };
+                var allowedFolders = new[] { "config", "remote" };
+
+                foreach (var file in Directory.GetFiles(src, "*", SearchOption.AllDirectories))
+                {
+                    var ext = Path.GetExtension(file).ToLower();
+                    var relativePath = Path.GetRelativePath(src, file);
+
+                    if (allowedExtensions.Contains(ext) && allowedFolders.Any(f => relativePath.StartsWith(f)))
+                    {
+                        var targetFile = file.Replace(src, dst);
+                        var targetDir = Path.GetDirectoryName(targetFile);
+                        if (!string.IsNullOrEmpty(targetDir)) Directory.CreateDirectory(targetDir);
+                        File.Copy(file, targetFile, true);
+                    }
+                }
+
+                _logger.Info($"Скопированы конфиги из {sourceId} в {targetId}");
+                ShowNotification($"Конфиги скопированы в {targetId}");
+            }
+            catch (Exception ex)
+            {
+                _logger.Error($"Ошибка копирования конфигов из {sourceId} в {targetId}", ex);
+                throw;
             }
         }
 
