@@ -1,851 +1,1007 @@
-using System;
-using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
-using System.Linq;
-using System.Runtime.InteropServices;
+using System.Net.Http;
 using System.Text;
 using System.Text.RegularExpressions;
-using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Imaging;
 using Microsoft.Win32;
+using Newtonsoft.Json;
 
-namespace SteamSwitcher
+namespace steamCenter
 {
     public partial class MainWindow : Window
     {
-        private string steamPath = @"C:\Program Files (x86)\Steam";
-        private string appData = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "SteamReg");
-        private string dbFile, favFile;
-        private string sourceID = "";
-        private Dictionary<string, AccountData> accountsData = new Dictionary<string, AccountData>();
-
-        [DllImport("user32.dll")]
-        private static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
-
-        private const uint WM_CLOSE = 0x0010;
-
-        public class AccountData
-        {
-            public string Password { get; set; }
-            public string Email { get; set; }
-            public string EmailPassword { get; set; }
-            public string Description { get; set; }
-            public DateTime CreationDate { get; set; }
-            public bool AutoCopyConfig { get; set; }
-            public bool SkipPasswordPrompt { get; set; }
-        }
-
-        public class SteamAccount
-        {
-            public string AccountName { get; set; }
-            public string PersonaName { get; set; }
-            public string AccountID32 { get; set; }
-            public string LastLoginFormatted { get; set; }
-            public ImageSource Avatar { get; set; }
-            public string Description { get; set; }
-            public bool HasDescription => !string.IsNullOrEmpty(Description);
-            public bool IsFavorite { get; set; }
-            public SolidColorBrush FavoriteColor => IsFavorite ? Brushes.Gold : Brushes.Transparent;
-            public bool HasPassword { get; set; }
-            public bool SkipPasswordPrompt { get; set; }
-        }
+        private LoggerService _logger;
+        private CredentialService _credentials;
+        private List<SteamAccount> _accounts = new List<SteamAccount>();
+        private string _sourceId = "";
+        private string _steamPath;
+        private SteamAccount? _currentContextAccount;
 
         public MainWindow()
         {
             InitializeComponent();
-            dbFile = Path.Combine(appData, "accounts.txt");
-            favFile = Path.Combine(appData, "favs.txt");
 
-            if (!Directory.Exists(appData)) Directory.CreateDirectory(appData);
+            _logger = new LoggerService();
+            _steamPath = DetectSteamPath();
+            _credentials = new CredentialService(_logger);
 
+            Loaded += async (s, e) => await LoadAllData();
+        }
+
+        private string DetectSteamPath()
+        {
             try
             {
-                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(@"Software\Valve\Steam"))
+                using (var key = Registry.CurrentUser.OpenSubKey(@"Software\Valve\Steam"))
                 {
                     if (key != null)
                     {
-                        var path = key.GetValue("SteamPath")?.ToString().Replace('/', '\\');
-                        if (path != null && Directory.Exists(path))
-                            steamPath = path;
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine($"Error: {ex.Message}");
-            }
-
-            LoadAllData();
-            LoadSteamAccounts();
-        }
-
-        private void LoadAllData()
-        {
-            LoadCredentials();
-            LoadFavorites();
-        }
-
-        private void LoadCredentials()
-        {
-            accountsData.Clear();
-            if (!File.Exists(dbFile)) return;
-
-            var lines = File.ReadAllLines(dbFile);
-            foreach (var line in lines)
-            {
-                if (string.IsNullOrWhiteSpace(line)) continue;
-
-                var parts = line.Split('|');
-                if (parts.Length < 2) continue;
-
-                var data = new AccountData();
-                string login = parts[0].Trim();
-
-                for (int i = 1; i < parts.Length; i++)
-                {
-                    var kv = parts[i].Trim().Split(':');
-                    if (kv.Length == 2)
-                    {
-                        string key = kv[0].Trim();
-                        string value = kv[1].Trim();
-
-                        switch (key)
+                        var path = key.GetValue("SteamPath")?.ToString()?.Replace('/', '\\');
+                        if (!string.IsNullOrEmpty(path) && Directory.Exists(path))
                         {
-                            case "P": data.Password = value; break;
-                            case "E": data.Email = value; break;
-                            case "EP": data.EmailPassword = value; break;
-                            case "D": data.Description = value; break;
-                            case "Date": if (DateTime.TryParse(value, out DateTime tempDate)) data.CreationDate = tempDate; break;
-                            case "AutoCopy": if (bool.TryParse(value, out bool tempAutoCopy)) data.AutoCopyConfig = tempAutoCopy; break;
-                            case "SkipPrompt": if (bool.TryParse(value, out bool tempSkip)) data.SkipPasswordPrompt = tempSkip; break;
+                            _logger?.Info($"Steam найден: {path}");
+                            return path;
                         }
                     }
                 }
-                accountsData[login.ToLower()] = data;
-            }
-        }
-
-        private void SaveCredentials()
-        {
-            var lines = new List<string>();
-            foreach (var acc in accountsData)
-            {
-                var data = acc.Value;
-                string line = $"{acc.Key} | P:{data.Password ?? ""} | E:{data.Email ?? ""} | EP:{data.EmailPassword ?? ""} | D:{data.Description ?? ""} | Date:{data.CreationDate:yyyy-MM-dd HH:mm:ss} | AutoCopy:{data.AutoCopyConfig} | SkipPrompt:{data.SkipPasswordPrompt}";
-                lines.Add(line);
-            }
-            File.WriteAllLines(dbFile, lines);
-        }
-
-        private void LoadFavorites()
-        {
-            if (!File.Exists(favFile))
-                File.WriteAllText(favFile, "");
-        }
-
-        private async void LoadSteamAccounts()
-        {
-            try
-            {
-                var accounts = new List<SteamAccount>();
-                string vdf = Path.Combine(steamPath, @"config\loginusers.vdf");
-
-                if (!File.Exists(vdf))
-                {
-                    AccountsList.ItemsSource = accounts;
-                    return;
-                }
-
-                string vdfContent = await Task.Run(() => File.ReadAllText(vdf, Encoding.UTF8));
-                var favs = File.Exists(favFile) ? File.ReadAllLines(favFile).ToList() : new List<string>();
-
-                foreach (Match m in Regex.Matches(vdfContent, "\"(\\d+)\"\\s*\\{([^}]+)\\}"))
-                {
-                    string id64 = m.Groups[1].Value;
-                    string block = m.Groups[2].Value;
-                    string acc = Regex.Match(block, "\"AccountName\"\\s+\"([^\"]+)\"").Groups[1].Value;
-                    string name = Regex.Match(block, "\"PersonaName\"\\s+\"([^\"]+)\"").Groups[1].Value;
-                    string ts = Regex.Match(block, "\"Timestamp\"\\s+\"([^\"]+)\"").Groups[1].Value;
-
-                    var item = new SteamAccount
-                    {
-                        AccountName = acc,
-                        PersonaName = string.IsNullOrEmpty(name) ? "Без имени" : name,
-                        AccountID32 = (long.Parse(id64) - 76561197960265728).ToString(),
-                        IsFavorite = favs.Contains(acc),
-                        Avatar = await GetAvatarAsync(id64),
-                        LastLoginFormatted = FormatLastLogin(ts),
-                        HasPassword = accountsData.ContainsKey(acc.ToLower()) && !string.IsNullOrEmpty(accountsData[acc.ToLower()]?.Password),
-                        SkipPasswordPrompt = accountsData.ContainsKey(acc.ToLower()) && accountsData[acc.ToLower()].SkipPasswordPrompt
-                    };
-
-                    if (accountsData.ContainsKey(acc.ToLower()))
-                    {
-                        item.Description = accountsData[acc.ToLower()].Description;
-                    }
-                    accounts.Add(item);
-                }
-
-                await Dispatcher.InvokeAsync(() =>
-                {
-                    AccountsList.ItemsSource = accounts.OrderByDescending(a => a.IsFavorite).ThenByDescending(a => a.LastLoginFormatted).ToList();
-                });
             }
             catch (Exception ex)
             {
-                MessageBox.Show($"Ошибка: {ex.Message}");
-            }
-        }
-
-        private string FormatLastLogin(string timestamp)
-        {
-            if (long.TryParse(timestamp, out long unixTime) && unixTime > 0)
-            {
-                DateTime dt = DateTimeOffset.FromUnixTimeSeconds(unixTime).LocalDateTime;
-                TimeSpan diff = DateTime.Now - dt;
-
-                string ago;
-                if (diff.TotalDays >= 1) ago = $"{(int)diff.TotalDays} дн. назад";
-                else if (diff.TotalHours >= 1) ago = $"{(int)diff.TotalHours} ч. назад";
-                else if (diff.TotalMinutes >= 1) ago = $"{(int)diff.TotalMinutes} мин. назад";
-                else ago = "Только что";
-
-                return $"Был: {dt:dd.MM.yyyy HH:mm} ({ago})";
-            }
-            return "Был: Никогда";
-        }
-
-        private async Task<ImageSource> GetAvatarAsync(string id64)
-        {
-            return await Task.Run(() =>
-            {
-                string[] possibleNames = { $"{id64}_full.jpg", $"{id64}.jpg", $"{id64}.png" };
-                string foundPath = null;
-
-                foreach (var name in possibleNames)
-                {
-                    string p = Path.Combine(steamPath, "config", "avatarcache", name);
-                    if (File.Exists(p))
-                    {
-                        foundPath = p;
-                        break;
-                    }
-                }
-
-                if (foundPath != null)
-                {
-                    try
-                    {
-                        var bitmap = new BitmapImage();
-                        bitmap.BeginInit();
-                        bitmap.UriSource = new Uri(foundPath);
-                        bitmap.CacheOption = BitmapCacheOption.OnLoad;
-                        bitmap.EndInit();
-                        bitmap.Freeze();
-                        return bitmap;
-                    }
-                    catch { }
-                }
-
-                return null;
-            });
-        }
-
-        // МЕТОД "БОЛЬШЕ НЕ СПРАШИВАТЬ"
-        private void ToggleSkipPassword_Click(object sender, RoutedEventArgs e)
-        {
-            string acc = (sender as MenuItem).Tag.ToString();
-            bool currentSkip = accountsData.ContainsKey(acc.ToLower()) && accountsData[acc.ToLower()].SkipPasswordPrompt;
-
-            if (!accountsData.ContainsKey(acc.ToLower()))
-                accountsData[acc.ToLower()] = new AccountData();
-
-            accountsData[acc.ToLower()].SkipPasswordPrompt = !currentSkip;
-            SaveCredentials();
-            LoadSteamAccounts();
-
-            ShowNotification(currentSkip ? "Уведомления о пароле включены" : "Уведомления о пароле отключены");
-        }
-
-        private async void LoginButton_Click(object sender, RoutedEventArgs e)
-        {
-            string acc = (sender as Button).Tag.ToString();
-            bool hasPassword = accountsData.ContainsKey(acc.ToLower()) && !string.IsNullOrEmpty(accountsData[acc.ToLower()].Password);
-            bool skipPrompt = accountsData.ContainsKey(acc.ToLower()) && accountsData[acc.ToLower()].SkipPasswordPrompt;
-
-            if (!hasPassword && !skipPrompt)
-            {
-                var passwordDialog = new PasswordInputDialog(acc);
-                if (passwordDialog.ShowDialog() == true)
-                {
-                    if (!accountsData.ContainsKey(acc.ToLower()))
-                        accountsData[acc.ToLower()] = new AccountData();
-                    accountsData[acc.ToLower()].Password = passwordDialog.Password;
-                    SaveCredentials();
-                    hasPassword = true;
-                }
-                else return;
+                _logger?.Error("Ошибка определения пути Steam", ex);
             }
 
-            if (!hasPassword) return;
+            var defaultPath = @"C:\Program Files (x86)\Steam";
+            _logger?.Info($"Используется путь Steam по умолчанию: {defaultPath}");
+            return defaultPath;
+        }
 
-            // Закрываем Steam
-            var progressDialog = new ProgressDialog("Закрытие Steam...");
-            progressDialog.Show();
-
-            bool isClosed = await KillAllSteamProcesses();
-
-            if (!isClosed)
-            {
-                progressDialog.Close();
-                var result = MessageBox.Show("Не удалось закрыть Steam. Закройте его вручную и нажмите OK.",
-                    "Ошибка", MessageBoxButton.OKCancel);
-                if (result != MessageBoxResult.OK) return;
-
-                progressDialog.Show();
-                isClosed = await KillAllSteamProcesses();
-                progressDialog.Close();
-                if (!isClosed) return;
-            }
-
-            progressDialog.UpdateMessage("Настройка входа...");
-
-            await CleanSteamRegistry();
-            await UpdateLoginUsersVDF(acc);
-
-            progressDialog.UpdateMessage("Запуск Steam...");
-
+        private async Task LoadAllData()
+        {
             try
             {
-                using (RegistryKey key = Registry.CurrentUser.OpenSubKey(@"Software\Valve\Steam", true))
-                {
-                    if (key != null)
-                    {
-                        key.SetValue("AutoLoginUser", acc);
-                        key.SetValue("RememberPassword", 1);
-                    }
-                }
-
-                var steamExe = Path.Combine(steamPath, "steam.exe");
-                if (File.Exists(steamExe))
-                {
-                    Process.Start(new ProcessStartInfo
-                    {
-                        FileName = steamExe,
-                        UseShellExecute = true
-                    });
-
-                    progressDialog.Close();
-                    MessageBox.Show($"Вход в аккаунт {acc} выполнен!", "Успех", MessageBoxButton.OK);
-                }
+                _credentials.Load();
+                await LoadSteamAccounts();
+                UpdateAccountsList();
+                _logger.Info("Данные успешно загружены");
             }
             catch (Exception ex)
             {
-                progressDialog.Close();
-                MessageBox.Show($"Ошибка: {ex.Message}", "Ошибка");
+                _logger.Error("Ошибка загрузки данных", ex);
+                MessageBox.Show($"Ошибка загрузки данных: {ex.Message}", "Ошибка",
+                               MessageBoxButton.OK, MessageBoxImage.Error);
             }
         }
 
-        private async Task<bool> KillAllSteamProcesses()
+        private List<string> LoadFavorites()
         {
-            try
-            {
-                string[] processNames = { "steam", "steamwebhelper", "steamservice" };
-
-                foreach (var name in processNames)
-                {
-                    foreach (var p in Process.GetProcessesByName(name))
-                    {
-                        try
-                        {
-                            if (p.MainWindowHandle != IntPtr.Zero)
-                                PostMessage(p.MainWindowHandle, WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
-                            await Task.Delay(300);
-                            if (!p.HasExited) p.Kill();
-                            p.Dispose();
-                        }
-                        catch { }
-                    }
-                }
-
-                await Task.Delay(2000);
-                return Process.GetProcessesByName("steam").Length == 0;
-            }
-            catch { return false; }
-        }
-
-        private async Task CleanSteamRegistry()
-        {
-            await Task.Run(() =>
+            var appDataDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SteamSwitcher");
+            var favFile = Path.Combine(appDataDir, "favorites.json");
+            if (File.Exists(favFile))
             {
                 try
                 {
-                    using (RegistryKey key = Registry.CurrentUser.OpenSubKey(@"Software\Valve\Steam", true))
+                    var json = File.ReadAllText(favFile);
+                    return JsonConvert.DeserializeObject<List<string>>(json) ?? new List<string>();
+                }
+                catch { }
+            }
+            return new List<string>();
+        }
+
+        private void SaveFavorites(List<string> favorites)
+        {
+            var appDataDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SteamSwitcher");
+            var favFile = Path.Combine(appDataDir, "favorites.json");
+            try
+            {
+                Directory.CreateDirectory(appDataDir);
+                File.WriteAllText(favFile + ".tmp", JsonConvert.SerializeObject(favorites));
+                File.Move(favFile + ".tmp", favFile, true);
+            }
+            catch (Exception ex)
+            {
+                _logger.Error("Ошибка сохранения избранного", ex);
+            }
+        }
+
+        /// <summary>
+        /// Прямой парсер для формата VDF Steam (без кавычек вокруг ID пользователей)
+        /// </summary>
+        private List<Dictionary<string, string>> ParseLoginUsersVdf(string content)
+        {
+            var accounts = new List<Dictionary<string, string>>();
+            var lines = content.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+
+            int i = 0;
+            while (i < lines.Length)
+            {
+                string line = lines[i].Trim();
+
+                // Пропускаем "users" и "{"
+                if (line == "\"users\"" || line == "users" || line == "{")
+                {
+                    i++;
+                    continue;
+                }
+
+                // Закрывающая скобка в конце
+                if (line == "}")
+                {
+                    i++;
+                    continue;
+                }
+
+                // Ищем ID пользователя (цифры, может быть в кавычках или без)
+                string userId = "";
+                if (line.StartsWith("\"") && line.EndsWith("\""))
+                {
+                    userId = line.Trim('"');
+                }
+                else if (Regex.IsMatch(line, @"^\d+$"))
+                {
+                    userId = line;
+                }
+
+                if (!string.IsNullOrEmpty(userId) && Regex.IsMatch(userId, @"^\d+$"))
+                {
+                    var accountData = new Dictionary<string, string>();
+                    accountData["SteamId"] = userId;
+
+                    i++; // Переходим к следующей строке (должна быть "{")
+
+                    if (i < lines.Length && lines[i].Trim() == "{")
                     {
-                        if (key != null)
+                        i++;
+                        // Читаем свойства до "}"
+                        while (i < lines.Length)
                         {
-                            key.SetValue("HSteamPipe", 0);
-                            key.SetValue("HSteamUser", 0);
+                            string propLine = lines[i].Trim();
+                            if (propLine == "}")
+                            {
+                                break;
+                            }
+
+                            if (!string.IsNullOrEmpty(propLine))
+                            {
+                                // Парсим "Key" "Value" или "Key" "Value" с табуляцией
+                                var match = Regex.Match(propLine, "\"([^\"]+)\"\\s+\"([^\"]*)\"");
+                                if (match.Success)
+                                {
+                                    string key = match.Groups[1].Value;
+                                    string value = match.Groups[2].Value;
+                                    accountData[key] = value;
+                                }
+                            }
+                            i++;
                         }
                     }
-                }
-                catch { }
-            });
-        }
 
-        private async Task UpdateLoginUsersVDF(string accountName)
-        {
-            await Task.Run(() =>
-            {
-                try
-                {
-                    string vdf = Path.Combine(steamPath, @"config\loginusers.vdf");
-                    if (!File.Exists(vdf)) return;
-
-                    string text = File.ReadAllText(vdf, Encoding.UTF8);
-                    text = Regex.Replace(text, "\"mostrecent\"\\s+\"1\"", "\"mostrecent\" \"0\"");
-                    string pattern = $"(\\{{\\s*\"AccountName\"\\s+\"{Regex.Escape(accountName)}\".*?\"mostrecent\"\\s+)\"0\"";
-                    text = Regex.Replace(text, pattern, "$1\"1\"", RegexOptions.Singleline);
-                    File.WriteAllText(vdf, text, Encoding.UTF8);
-                }
-                catch { }
-            });
-        }
-
-        private void OpenAddAccountDialog_Click(object sender, RoutedEventArgs e)
-        {
-            var dialog = new AddAccountDialog();
-            dialog.AccountCreated += (login, password, email, emailPassword, description, autoCopyConfig) =>
-            {
-                var loginLower = login.ToLower();
-                if (!accountsData.ContainsKey(loginLower))
-                {
-                    accountsData[loginLower] = new AccountData
+                    if (accountData.ContainsKey("AccountName"))
                     {
-                        Password = password,
-                        Email = email,
-                        EmailPassword = emailPassword,
-                        Description = description,
-                        CreationDate = DateTime.Now,
-                        AutoCopyConfig = autoCopyConfig,
-                        SkipPasswordPrompt = false
-                    };
-                    SaveCredentials();
-                    LoadSteamAccounts();
+                        accounts.Add(accountData);
+                        _logger.Info($"Найден аккаунт: {accountData["AccountName"]} ({accountData.GetValueOrDefault("PersonaName", "Unknown")})");
+                    }
                 }
-                else
-                {
-                    MessageBox.Show("Аккаунт уже существует!");
-                }
-            };
-            dialog.ShowDialog();
-        }
-
-        private void EditAccount_Click(object sender, RoutedEventArgs e)
-        {
-            string acc = (sender as MenuItem).Tag.ToString();
-            if (accountsData.ContainsKey(acc.ToLower()))
-            {
-                var data = accountsData[acc.ToLower()];
-                var dialog = new EditAccountDialog(acc, data.Password, data.Email, data.EmailPassword, data.Description, data.AutoCopyConfig, data.SkipPasswordPrompt);
-                dialog.AccountUpdated += (login, password, email, emailPassword, description, autoCopyConfig, skipPasswordPrompt) =>
-                {
-                    accountsData[login.ToLower()] = new AccountData
-                    {
-                        Password = password,
-                        Email = email,
-                        EmailPassword = emailPassword,
-                        Description = description,
-                        CreationDate = data.CreationDate,
-                        AutoCopyConfig = autoCopyConfig,
-                        SkipPasswordPrompt = skipPasswordPrompt
-                    };
-                    SaveCredentials();
-                    LoadSteamAccounts();
-                };
-                dialog.ShowDialog();
+                i++;
             }
+
+            return accounts;
         }
 
-        private void DeleteAccount_Click(object sender, RoutedEventArgs e)
+        private async Task LoadSteamAccounts()
         {
-            string acc = (sender as MenuItem).Tag.ToString();
-            if (MessageBox.Show($"Удалить аккаунт {acc}?", "Подтверждение", MessageBoxButton.YesNo) == MessageBoxResult.Yes)
+            var vdfPath = Path.Combine(_steamPath, "config", "loginusers.vdf");
+
+            if (!File.Exists(vdfPath))
             {
-                accountsData.Remove(acc.ToLower());
-                SaveCredentials();
-                LoadSteamAccounts();
-            }
-        }
-
-        private void CopyLogin_Click(object sender, RoutedEventArgs e)
-        {
-            string acc = (sender as MenuItem).Tag.ToString();
-            Clipboard.SetText(acc);
-            ShowNotification("Логин скопирован!");
-        }
-
-        private void CopyPassword_Click(object sender, RoutedEventArgs e)
-        {
-            string acc = (sender as MenuItem).Tag.ToString();
-            if (accountsData.ContainsKey(acc.ToLower()) && !string.IsNullOrEmpty(accountsData[acc.ToLower()].Password))
-            {
-                Clipboard.SetText(accountsData[acc.ToLower()].Password);
-                ShowNotification("Пароль скопирован!");
-            }
-            else
-            {
-                MessageBox.Show("Пароль не сохранен.");
-            }
-        }
-
-        private void CopyEmail_Click(object sender, RoutedEventArgs e)
-        {
-            string acc = (sender as MenuItem).Tag.ToString();
-            if (accountsData.ContainsKey(acc.ToLower()) && !string.IsNullOrEmpty(accountsData[acc.ToLower()].Email))
-            {
-                Clipboard.SetText(accountsData[acc.ToLower()].Email);
-                ShowNotification("Email скопирован!");
-            }
-            else
-            {
-                MessageBox.Show("Email не сохранен.");
-            }
-        }
-
-        private void EditDescription_Click(object sender, RoutedEventArgs e)
-        {
-            string acc = (sender as MenuItem).Tag.ToString();
-            string currentDesc = accountsData.ContainsKey(acc.ToLower()) ? accountsData[acc.ToLower()].Description : "";
-
-            var dialog = new TextInputDialog($"Описание для {acc}", currentDesc);
-            if (dialog.ShowDialog() == true && dialog.InputText != null)
-            {
-                if (!accountsData.ContainsKey(acc.ToLower()))
-                    accountsData[acc.ToLower()] = new AccountData();
-                accountsData[acc.ToLower()].Description = dialog.InputText;
-                SaveCredentials();
-                LoadSteamAccounts();
-            }
-        }
-
-        private void ShowNotification(string message)
-        {
-            var notification = new NotificationWindow(message);
-            notification.Show();
-            var timer = new System.Windows.Threading.DispatcherTimer();
-            timer.Interval = TimeSpan.FromSeconds(2);
-            timer.Tick += (s, e) => { timer.Stop(); notification.Close(); };
-            timer.Start();
-        }
-
-        private void SetSource_Click(object sender, RoutedEventArgs e)
-        {
-            sourceID = (sender as Button).Tag.ToString();
-            SourceStatus.Text = $" | Источник: {sourceID}";
-            SourceStatus.Foreground = Brushes.Gold;
-        }
-
-        private async void ApplySource_Click(object sender, RoutedEventArgs e)
-        {
-            if (string.IsNullOrEmpty(sourceID))
-            {
-                MessageBox.Show("Сначала выберите источник.");
+                MessageBox.Show($"loginusers.vdf не найден:\n{vdfPath}\n\nУбедитесь, что Steam установлен.",
+                               "Ошибка", MessageBoxButton.OK, MessageBoxImage.Error);
                 return;
             }
 
-            string targetID = (sender as Button).Tag.ToString();
-            await Task.Run(() => CopyConfigurations(sourceID, targetID));
-            MessageBox.Show("Настройки скопированы!");
+            try
+            {
+                // Снимаем атрибут "Только чтение" если он есть
+                var fileInfo = new FileInfo(vdfPath);
+                if (fileInfo.IsReadOnly)
+                {
+                    _logger.Info($"Снимаем атрибут 'Только чтение' с файла {vdfPath}");
+                    fileInfo.IsReadOnly = false;
+                }
+
+                // Читаем файл с правильной кодировкой
+                string content = File.ReadAllText(vdfPath, Encoding.UTF8);
+                _logger.Info($"Файл loginusers.vdf загружен, размер: {content.Length} байт");
+
+                // Парсим файл
+                var parsedAccounts = ParseLoginUsersVdf(content);
+                _logger.Info($"Найдено пользователей: {parsedAccounts.Count}");
+
+                var favorites = LoadFavorites();
+                _accounts.Clear();
+
+                foreach (var accountData in parsedAccounts)
+                {
+                    try
+                    {
+                        var steamId = accountData.GetValueOrDefault("SteamId", "");
+                        var accountName = accountData.GetValueOrDefault("AccountName", "Unknown");
+                        var personaName = accountData.GetValueOrDefault("PersonaName", "Unknown");
+
+                        DateTime lastLogin = DateTime.MinValue;
+                        if (accountData.TryGetValue("Timestamp", out string? timestampStr) && !string.IsNullOrEmpty(timestampStr))
+                        {
+                            if (long.TryParse(timestampStr, out long timestamp) && timestamp > 0)
+                                lastLogin = DateTimeOffset.FromUnixTimeSeconds(timestamp).DateTime;
+                        }
+
+                        var hasPassword = _credentials.HasAccount(accountName);
+                        var description = _credentials.GetDescription(accountName) ?? "";
+                        var skipPasswordPrompt = _credentials.GetSkipPasswordPrompt(accountName);
+                        var isFavorite = favorites.Contains(accountName);
+
+                        var avatarPath = await DownloadAvatar(steamId);
+                        BitmapImage? avatar = null;
+                        if (!string.IsNullOrEmpty(avatarPath) && File.Exists(avatarPath))
+                        {
+                            try { avatar = new BitmapImage(new Uri(avatarPath)); }
+                            catch { }
+                        }
+
+                        _accounts.Add(new SteamAccount
+                        {
+                            AccountName = accountName,
+                            AccountId32 = steamId,
+                            SteamId64 = steamId,
+                            PersonaName = personaName,
+                            Description = description,
+                            Avatar = avatar,
+                            AvatarPath = avatarPath,
+                            IsFavorite = isFavorite,
+                            LastLogin = lastLogin,
+                            HasPassword = hasPassword,
+                            SkipPasswordPrompt = skipPasswordPrompt
+                        });
+
+                        _logger.Info($"Добавлен аккаунт: {accountName} ({personaName})");
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.Error($"Ошибка обработки аккаунта", ex);
+                    }
+                }
+
+                _accounts = _accounts.OrderByDescending(x => x.IsFavorite)
+                                     .ThenByDescending(x => x.LastLogin)
+                                     .ToList();
+
+                StatusLabel.Text = $"Аккаунтов загружено: {_accounts.Count}";
+
+                if (_accounts.Count == 0)
+                {
+                    MessageBox.Show($"Не удалось найти аккаунты в файле:\n{vdfPath}\n\n" +
+                                   "Возможно, файл поврежден.\n\n" +
+                                   "Попробуйте:\n" +
+                                   "1. Закрыть Steam\n" +
+                                   "2. Удалить файл loginusers.vdf\n" +
+                                   "3. Запустить Steam и войти в аккаунт\n" +
+                                   "4. Запустить приложение снова",
+                                   "Предупреждение", MessageBoxButton.OK, MessageBoxImage.Warning);
+                }
+                else
+                {
+                    _logger.Info($"Успешно загружено {_accounts.Count} аккаунтов");
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.Error("Ошибка загрузки Steam аккаунтов", ex);
+                MessageBox.Show($"Ошибка загрузки Steam аккаунтов:\n{ex.Message}\n\n" +
+                               $"Путь: {vdfPath}",
+                               "Ошибка", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+
+        private async Task<string> DownloadAvatar(string steamId)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(steamId))
+                    return "";
+
+                var avatarDir = Path.Combine(_steamPath, "config", "avatarcache");
+                Directory.CreateDirectory(avatarDir);
+
+                var possibleFiles = new[]
+                {
+                    Path.Combine(avatarDir, $"{steamId}_full.jpg"),
+                    Path.Combine(avatarDir, $"{steamId}.jpg"),
+                    Path.Combine(avatarDir, $"{steamId}.png")
+                };
+
+                foreach (var file in possibleFiles)
+                {
+                    if (File.Exists(file))
+                        return file;
+                }
+
+                var appDataDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SteamSwitcher");
+                var url = $"https://avatars.steamstatic.com/{steamId}_full.jpg";
+                using (var client = new HttpClient())
+                {
+                    client.Timeout = TimeSpan.FromSeconds(10);
+                    var response = await client.GetAsync(url);
+                    if (response.IsSuccessStatusCode)
+                    {
+                        var avatarPath = Path.Combine(appDataDir, "avatars", $"{steamId}.jpg");
+                        Directory.CreateDirectory(Path.GetDirectoryName(avatarPath) ?? "");
+                        var data = await response.Content.ReadAsByteArrayAsync();
+                        await File.WriteAllBytesAsync(avatarPath, data);
+                        return avatarPath;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.Error($"Ошибка загрузки аватара для {steamId}", ex);
+            }
+            return "";
+        }
+
+        private void UpdateAccountsList()
+        {
+            AccountsPanel.Children.Clear();
+
+            foreach (var account in _accounts)
+            {
+                var widget = CreateAccountWidget(account);
+                AccountsPanel.Children.Add(widget);
+            }
+
+            StatusLabel.Text = string.IsNullOrEmpty(_sourceId) ? " | Конфиг не выбран" : $" | Источник: {_sourceId}";
+        }
+
+        private FrameworkElement CreateAccountWidget(SteamAccount account)
+        {
+            var border = new Border
+            {
+                Style = (Style)FindResource("AccountCard"),
+                Tag = account
+            };
+
+            var grid = new Grid();
+            border.Child = grid;
+
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+
+            if (account.IsFavorite)
+            {
+                var starLabel = new TextBlock
+                {
+                    Text = "★",
+                    Foreground = Brushes.Gold,
+                    FontSize = 26,
+                    VerticalAlignment = VerticalAlignment.Center,
+                    Margin = new Thickness(5, 0, 10, 0)
+                };
+                Grid.SetColumn(starLabel, 0);
+                grid.Children.Add(starLabel);
+            }
+
+            var avatarBorder = new Border
+            {
+                Width = 55,
+                Height = 55,
+                CornerRadius = new CornerRadius(27.5),
+                Margin = new Thickness(5),
+                Background = new SolidColorBrush(Color.FromRgb(61, 90, 112))
+            };
+
+            if (account.Avatar != null)
+            {
+                var avatarImg = new Image
+                {
+                    Source = account.Avatar,
+                    Stretch = Stretch.UniformToFill
+                };
+                avatarBorder.Child = avatarImg;
+            }
+            else
+            {
+                var defaultAvatar = new TextBlock
+                {
+                    Text = "👤",
+                    Foreground = new SolidColorBrush(Color.FromRgb(61, 90, 112)),
+                    FontSize = 30,
+                    HorizontalAlignment = HorizontalAlignment.Center,
+                    VerticalAlignment = VerticalAlignment.Center
+                };
+                avatarBorder.Child = defaultAvatar;
+            }
+            Grid.SetColumn(avatarBorder, 1);
+            grid.Children.Add(avatarBorder);
+
+            var infoPanel = new StackPanel
+            {
+                Margin = new Thickness(10, 5, 10, 5),
+                VerticalAlignment = VerticalAlignment.Center
+            };
+
+            infoPanel.Children.Add(new TextBlock
+            {
+                Text = account.PersonaName,
+                Foreground = Brushes.White,
+                FontSize = 14,
+                FontWeight = FontWeights.Bold
+            });
+
+            infoPanel.Children.Add(new TextBlock
+            {
+                Text = account.AccountName,
+                Foreground = (SolidColorBrush)FindResource("SteamBlue"),
+                FontSize = 10
+            });
+
+            if (!string.IsNullOrEmpty(account.Description))
+            {
+                infoPanel.Children.Add(new TextBlock
+                {
+                    Text = account.Description,
+                    Foreground = Brushes.Gold,
+                    FontSize = 10,
+                    FontStyle = FontStyles.Italic
+                });
+            }
+
+            infoPanel.Children.Add(new TextBlock
+            {
+                Text = account.LastLoginFormatted,
+                Foreground = (SolidColorBrush)FindResource("TextGray"),
+                FontSize = 9
+            });
+
+            if (account.HasPassword)
+            {
+                infoPanel.Children.Add(new TextBlock
+                {
+                    Text = "✓ Пароль сохранен",
+                    Foreground = (SolidColorBrush)FindResource("SuccessGreen"),
+                    FontSize = 9
+                });
+            }
+
+            if (account.SkipPasswordPrompt)
+            {
+                infoPanel.Children.Add(new TextBlock
+                {
+                    Text = "🔕 Уведомления отключены",
+                    Foreground = (SolidColorBrush)FindResource("WarningOrange"),
+                    FontSize = 9
+                });
+            }
+
+            Grid.SetColumn(infoPanel, 2);
+            grid.Children.Add(infoPanel);
+
+            var configPanel = new StackPanel
+            {
+                Margin = new Thickness(5),
+                VerticalAlignment = VerticalAlignment.Center
+            };
+
+            var takeBtn = new Button
+            {
+                Content = "ВЗЯТЬ КОНФИГИ",
+                Style = (Style)FindResource("ConfigButton"),
+                Tag = account
+            };
+            takeBtn.Click += (s, e) => SetSource(account);
+
+            var applyBtn = new Button
+            {
+                Content = "ПРИМЕНИТЬ ВСЕМ",
+                Style = (Style)FindResource("ConfigButton"),
+                Background = new SolidColorBrush(Color.FromRgb(61, 90, 112)),
+                Foreground = (SolidColorBrush)FindResource("SteamBlue"),
+                Margin = new Thickness(0, 5, 0, 0),
+                Tag = account
+            };
+            applyBtn.Click += (s, e) => ApplySource(account);
+
+            configPanel.Children.Add(takeBtn);
+            configPanel.Children.Add(applyBtn);
+
+            Grid.SetColumn(configPanel, 3);
+            grid.Children.Add(configPanel);
+
+            var loginBtn = new Button
+            {
+                Content = "ВОЙТИ",
+                Style = (Style)FindResource("LoginButton"),
+                Margin = new Thickness(5, 0, 10, 0),
+                Tag = account
+            };
+            loginBtn.Click += async (s, e) => await LoginAccount(account);
+
+            Grid.SetColumn(loginBtn, 4);
+            grid.Children.Add(loginBtn);
+
+            border.MouseRightButtonDown += (s, e) =>
+            {
+                _currentContextAccount = account;
+                ShowContextMenu();
+                e.Handled = true;
+            };
+
+            return border;
+        }
+
+        private void ShowContextMenu()
+        {
+            var contextMenu = new ContextMenu();
+            contextMenu.Background = new SolidColorBrush(Color.FromRgb(42, 71, 94));
+            contextMenu.Foreground = Brushes.White;
+
+            var copyLogin = new MenuItem { Header = "📋 Скопировать Логин", Tag = "copy_login" };
+            copyLogin.Click += ContextMenuItem_Click;
+            contextMenu.Items.Add(copyLogin);
+
+            var copyPassword = new MenuItem { Header = "📋 Скопировать Пароль", Tag = "copy_password" };
+            copyPassword.Click += ContextMenuItem_Click;
+            contextMenu.Items.Add(copyPassword);
+
+            var copyEmail = new MenuItem { Header = "📧 Скопировать Email", Tag = "copy_email" };
+            copyEmail.Click += ContextMenuItem_Click;
+            contextMenu.Items.Add(copyEmail);
+
+            contextMenu.Items.Add(new Separator());
+
+            var editDesc = new MenuItem { Header = "📝 Изменить описание", Tag = "edit_desc" };
+            editDesc.Click += ContextMenuItem_Click;
+            contextMenu.Items.Add(editDesc);
+
+            var editAccount = new MenuItem { Header = "✏️ Редактировать данные", Tag = "edit_account" };
+            editAccount.Click += ContextMenuItem_Click;
+            contextMenu.Items.Add(editAccount);
+
+            contextMenu.Items.Add(new Separator());
+
+            var toggleFav = new MenuItem { Header = "⭐ В избранное / Убрать", Tag = "toggle_fav" };
+            toggleFav.Click += ContextMenuItem_Click;
+            contextMenu.Items.Add(toggleFav);
+
+            var toggleSkip = new MenuItem { Header = "🔕 Больше не спрашивать пароль", Tag = "toggle_skip" };
+            toggleSkip.Click += ContextMenuItem_Click;
+            contextMenu.Items.Add(toggleSkip);
+
+            contextMenu.Items.Add(new Separator());
+
+            var delete = new MenuItem { Header = "🗑️ Удалить аккаунт", Tag = "delete" };
+            delete.Click += ContextMenuItem_Click;
+            contextMenu.Items.Add(delete);
+
+            contextMenu.IsOpen = true;
+        }
+
+        private async void ContextMenuItem_Click(object sender, RoutedEventArgs e)
+        {
+            var item = sender as MenuItem;
+            if (item?.Tag == null || _currentContextAccount == null) return;
+
+            switch (item.Tag.ToString())
+            {
+                case "copy_login":
+                    Clipboard.SetText(_currentContextAccount.AccountName);
+                    ShowNotification("Логин скопирован!");
+                    break;
+                case "copy_password":
+                    var pwd = _credentials.GetPassword(_currentContextAccount.AccountName);
+                    if (!string.IsNullOrEmpty(pwd))
+                    {
+                        Clipboard.SetText(pwd);
+                        ShowNotification("Пароль скопирован!");
+                    }
+                    else MessageBox.Show("Пароль не сохранен для этого аккаунта.", "Информация", MessageBoxButton.OK, MessageBoxImage.Information);
+                    break;
+                case "copy_email":
+                    var email = _credentials.GetEmail(_currentContextAccount.AccountName);
+                    if (!string.IsNullOrEmpty(email))
+                    {
+                        Clipboard.SetText(email);
+                        ShowNotification("Email скопирован!");
+                    }
+                    else MessageBox.Show("Email не сохранен для этого аккаунта.", "Информация", MessageBoxButton.OK, MessageBoxImage.Information);
+                    break;
+                case "edit_desc":
+                    await EditDescription();
+                    break;
+                case "edit_account":
+                    await EditAccount();
+                    break;
+                case "toggle_fav":
+                    await ToggleFavorite();
+                    break;
+                case "toggle_skip":
+                    await ToggleSkipPassword();
+                    break;
+                case "delete":
+                    await DeleteAccount();
+                    break;
+            }
+        }
+
+        private bool ShutdownSteam()
+        {
+            try
+            {
+                foreach (var process in Process.GetProcessesByName("steam"))
+                    process.Kill();
+                foreach (var process in Process.GetProcessesByName("steamwebhelper"))
+                    process.Kill();
+
+                for (int i = 0; i < 30; i++)
+                {
+                    if (Process.GetProcessesByName("steam").Length == 0)
+                        return true;
+                    Thread.Sleep(1000);
+                }
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.Error("Ошибка закрытия Steam", ex);
+                return false;
+            }
+        }
+
+        private void SetAutoLogin(string accountName)
+        {
+            try
+            {
+                var vdfPath = Path.Combine(_steamPath, "config", "loginusers.vdf");
+                if (!File.Exists(vdfPath)) return;
+
+                var content = File.ReadAllText(vdfPath, Encoding.UTF8);
+                var lines = content.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries).ToList();
+
+                // Сбрасываем MostRecent для всех
+                for (int i = 0; i < lines.Count; i++)
+                {
+                    if (lines[i].Contains("MostRecent"))
+                    {
+                        lines[i] = Regex.Replace(lines[i], "\"MostRecent\"\\s+\"\\d\"", "\"MostRecent\"\t\t\"0\"");
+                    }
+                }
+
+                // Устанавливаем MostRecent = 1 для нужного аккаунта
+                bool inUserSection = false;
+
+                for (int i = 0; i < lines.Count; i++)
+                {
+                    string line = lines[i].Trim();
+
+                    // Начало секции пользователя (цифровой ID)
+                    if (line.StartsWith("\"") && Regex.IsMatch(line.Trim('"'), @"^\d+$"))
+                    {
+                        inUserSection = true;
+                    }
+                    else if (inUserSection && line.Contains("AccountName") && line.Contains(accountName))
+                    {
+                        // Нашли нужного пользователя, ищем MostRecent
+                        for (int j = i; j < lines.Count && lines[j].Trim() != "}"; j++)
+                        {
+                            if (lines[j].Contains("MostRecent"))
+                            {
+                                lines[j] = "\t\t\"MostRecent\"\t\t\"1\"";
+                                break;
+                            }
+                        }
+                        break;
+                    }
+                    else if (inUserSection && line == "}")
+                    {
+                        inUserSection = false;
+                    }
+                }
+
+                File.WriteAllText(vdfPath, string.Join(Environment.NewLine, lines), Encoding.UTF8);
+
+                using (var key = Registry.CurrentUser.OpenSubKey(@"Software\Valve\Steam", true))
+                {
+                    if (key != null)
+                    {
+                        key.SetValue("AutoLoginUser", accountName, RegistryValueKind.String);
+                        key.SetValue("RememberPassword", 1, RegistryValueKind.DWord);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.Error("Ошибка установки автовхода", ex);
+            }
         }
 
         private void CopyConfigurations(string sourceId, string targetId)
         {
-            string src = Path.Combine(steamPath, "userdata", sourceId);
-            string dst = Path.Combine(steamPath, "userdata", targetId);
-            if (!Directory.Exists(src)) return;
-            Directory.CreateDirectory(dst);
+            try
+            {
+                var src = Path.Combine(_steamPath, "userdata", sourceId);
+                var dst = Path.Combine(_steamPath, "userdata", targetId);
 
-            foreach (string dir in Directory.GetDirectories(src, "*", SearchOption.AllDirectories))
-                Directory.CreateDirectory(dir.Replace(src, dst));
+                if (!Directory.Exists(src))
+                {
+                    _logger.Warning($"Исходная папка конфигов не найдена: {src}");
+                    return;
+                }
 
-            foreach (string file in Directory.GetFiles(src, "*.*", SearchOption.AllDirectories))
-                File.Copy(file, file.Replace(src, dst), true);
+                Directory.CreateDirectory(dst);
+
+                var allowedExtensions = new[] { ".vdf", ".cfg", ".txt" };
+                var allowedFolders = new[] { "config", "remote" };
+
+                foreach (var file in Directory.GetFiles(src, "*", SearchOption.AllDirectories))
+                {
+                    var ext = Path.GetExtension(file).ToLower();
+                    var relativePath = Path.GetRelativePath(src, file);
+
+                    if (allowedExtensions.Contains(ext) && allowedFolders.Any(f => relativePath.StartsWith(f)))
+                    {
+                        var targetFile = file.Replace(src, dst);
+                        var targetDir = Path.GetDirectoryName(targetFile);
+                        if (!string.IsNullOrEmpty(targetDir)) Directory.CreateDirectory(targetDir);
+                        File.Copy(file, targetFile, true);
+                    }
+                }
+
+                _logger.Info($"Скопированы конфиги из {sourceId} в {targetId}");
+            }
+            catch (Exception ex)
+            {
+                _logger.Error($"Ошибка копирования конфигов из {sourceId} в {targetId}", ex);
+                throw;
+            }
         }
 
-        private void Favorite_Click(object sender, RoutedEventArgs e)
+        private async Task LoginAccount(SteamAccount account)
         {
-            string acc = (sender as MenuItem).Tag.ToString();
-            var favs = File.Exists(favFile) ? File.ReadAllLines(favFile).ToList() : new List<string>();
-            if (favs.Contains(acc)) favs.Remove(acc);
-            else favs.Add(acc);
-            File.WriteAllLines(favFile, favs);
-            LoadSteamAccounts();
+            try
+            {
+                var hasPassword = !string.IsNullOrEmpty(_credentials.GetPassword(account.AccountName));
+                var skipPrompt = _credentials.GetSkipPasswordPrompt(account.AccountName);
+
+                if (!hasPassword && !skipPrompt)
+                {
+                    var dialog = new PasswordInputDialog(account.AccountName);
+                    dialog.Owner = this;
+                    if (dialog.ShowDialog() == true)
+                    {
+                        _credentials.SetPassword(account.AccountName, dialog.Password);
+                        _credentials.Save();
+                        hasPassword = true;
+                    }
+                    else return;
+                }
+
+                if (!hasPassword) return;
+
+                StatusLabel.Text = "Закрытие Steam...";
+
+                if (!ShutdownSteam())
+                {
+                    MessageBox.Show("Steam не закрылся", "Ошибка", MessageBoxButton.OK, MessageBoxImage.Error);
+                    return;
+                }
+
+                StatusLabel.Text = "Подготовка входа...";
+                SetAutoLogin(account.AccountName);
+
+                await Task.Delay(1500);
+
+                var steamExe = Path.Combine(_steamPath, "steam.exe");
+                Process.Start(steamExe);
+
+                StatusLabel.Text = $"Вход: {account.AccountName}";
+                ShowNotification($"Вход в {account.AccountName}");
+
+                account.LastLogin = DateTime.Now;
+                await LoadAllData();
+            }
+            catch (Exception ex)
+            {
+                _logger.Error("Ошибка входа", ex);
+                MessageBox.Show(ex.Message, "Ошибка", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
         }
 
-        private void OpenDatabase_Click(object sender, RoutedEventArgs e)
+        private async void OpenAddAccount()
         {
-            try { Process.Start(new ProcessStartInfo("notepad.exe", dbFile) { UseShellExecute = true }); }
-            catch { }
+            var dialog = new AddAccountDialog();
+            dialog.Owner = this;
+            if (dialog.ShowDialog() == true && dialog.ResultData != null)
+            {
+                var login = dialog.ResultData.Login.ToLower();
+
+                if (!_credentials.HasAccount(login))
+                {
+                    _credentials.SetPassword(login, dialog.ResultData.Password);
+                    _credentials.SetEmail(login, dialog.ResultData.Email);
+                    _credentials.SetEmailPassword(login, dialog.ResultData.EmailPassword);
+                    _credentials.SetDescription(login, dialog.ResultData.Description);
+                    _credentials.SetAutoCopyConfig(login, dialog.ResultData.AutoCopyConfig);
+                    _credentials.Save();
+                    await LoadAllData();
+                    ShowNotification($"Аккаунт {login} добавлен");
+                }
+                else
+                {
+                    MessageBox.Show("Аккаунт уже существует!", "Ошибка", MessageBoxButton.OK, MessageBoxImage.Error);
+                }
+            }
         }
 
-        private void RefreshList_Click(object sender, RoutedEventArgs e)
+        private async Task EditAccount()
         {
-            LoadAllData();
-            LoadSteamAccounts();
+            if (_currentContextAccount == null) return;
+
+            var acc = _currentContextAccount;
+            var dialog = new EditAccountDialog(
+                acc.AccountName,
+                _credentials.GetPassword(acc.AccountName) ?? "",
+                _credentials.GetEmail(acc.AccountName) ?? "",
+                _credentials.GetEmailPassword(acc.AccountName) ?? "",
+                _credentials.GetDescription(acc.AccountName) ?? "",
+                _credentials.GetAutoCopyConfig(acc.AccountName),
+                _credentials.GetSkipPasswordPrompt(acc.AccountName));
+            dialog.Owner = this;
+
+            if (dialog.ShowDialog() == true && dialog.ResultData != null)
+            {
+                var data = dialog.ResultData;
+                _credentials.SetPassword(data.Login, data.Password);
+                _credentials.SetEmail(data.Login, data.Email);
+                _credentials.SetEmailPassword(data.Login, data.EmailPassword);
+                _credentials.SetDescription(data.Login, data.Description);
+                _credentials.SetAutoCopyConfig(data.Login, data.AutoCopyConfig);
+                _credentials.SetSkipPasswordPrompt(data.Login, data.SkipPasswordPrompt);
+                _credentials.Save();
+                await LoadAllData();
+                ShowNotification("Данные обновлены");
+            }
         }
-    }
 
-    // Диалоговые окна (оставляем как есть из предыдущего кода)
-    public class ProgressDialog : Window
-    {
-        private TextBlock messageText;
-        private ProgressBar progressBar;
-
-        public ProgressDialog(string initialMessage)
+        private async Task DeleteAccount()
         {
-            Title = "Подождите";
-            Width = 400;
-            Height = 120;
-            WindowStartupLocation = WindowStartupLocation.CenterScreen;
-            WindowStyle = WindowStyle.None;
-            Topmost = true;
-            Background = new SolidColorBrush(Color.FromRgb(30, 30, 30));
-            Opacity = 0.95;
+            if (_currentContextAccount == null) return;
 
-            var stackPanel = new StackPanel { Margin = new Thickness(20) };
-            messageText = new TextBlock { Text = initialMessage, Foreground = Brushes.White, FontSize = 14, HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 0, 0, 15) };
-            progressBar = new ProgressBar { Height = 25, IsIndeterminate = true, Foreground = Brushes.LightGreen, Background = Brushes.DarkGray };
-            stackPanel.Children.Add(messageText);
-            stackPanel.Children.Add(progressBar);
-            Content = stackPanel;
+            var acc = _currentContextAccount;
+            if (MessageBox.Show($"Удалить аккаунт {acc.AccountName}? Это действие нельзя отменить.",
+                               "Подтверждение", MessageBoxButton.YesNo, MessageBoxImage.Question) == MessageBoxResult.Yes)
+            {
+                _credentials.RemoveAccount(acc.AccountName);
+                _credentials.Save();
+                await LoadAllData();
+                ShowNotification($"Аккаунт {acc.AccountName} удален");
+            }
         }
 
-        public void UpdateMessage(string message)
+        private async Task EditDescription()
         {
-            Dispatcher.Invoke(() => messageText.Text = message);
+            if (_currentContextAccount == null) return;
+
+            var acc = _currentContextAccount;
+            var currentDesc = _credentials.GetDescription(acc.AccountName) ?? "";
+            var dialog = new TextInputDialog($"Введите описание для {acc.AccountName}", currentDesc);
+            dialog.Owner = this;
+
+            if (dialog.ShowDialog() == true)
+            {
+                _credentials.SetDescription(acc.AccountName, dialog.InputText);
+                _credentials.Save();
+                await LoadAllData();
+                ShowNotification("Описание обновлено");
+            }
         }
-    }
 
-    public class PasswordInputDialog : Window
-    {
-        public string Password { get; private set; }
-        private PasswordBox passwordBox;
-
-        public PasswordInputDialog(string accountName)
+        private async Task ToggleSkipPassword()
         {
-            Title = $"Введите пароль для {accountName}";
-            Width = 400;
-            Height = 180;
-            WindowStartupLocation = WindowStartupLocation.CenterScreen;
-            ResizeMode = ResizeMode.NoResize;
-            Background = Brushes.White;
+            if (_currentContextAccount == null) return;
 
-            var stackPanel = new StackPanel { Margin = new Thickness(15) };
-            stackPanel.Children.Add(new TextBlock { Text = $"Введите пароль для аккаунта {accountName}:", Margin = new Thickness(0, 0, 0, 10), FontSize = 13, FontWeight = FontWeights.Bold });
-            passwordBox = new PasswordBox { Height = 35, Margin = new Thickness(0, 0, 0, 15), FontSize = 12 };
-            stackPanel.Children.Add(passwordBox);
-
-            var buttonPanel = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right };
-            var okButton = new Button { Content = "OK", Width = 80, Height = 32, Margin = new Thickness(5), Background = Brushes.LightGreen, FontWeight = FontWeights.Bold };
-            var cancelButton = new Button { Content = "Отмена", Width = 80, Height = 32, Margin = new Thickness(5) };
-            okButton.Click += (s, e) => { Password = passwordBox.Password; DialogResult = true; };
-            cancelButton.Click += (s, e) => DialogResult = false;
-
-            buttonPanel.Children.Add(okButton);
-            buttonPanel.Children.Add(cancelButton);
-            stackPanel.Children.Add(buttonPanel);
-            Content = stackPanel;
-            Loaded += (s, e) => passwordBox.Focus();
+            var acc = _currentContextAccount;
+            var current = _credentials.GetSkipPasswordPrompt(acc.AccountName);
+            _credentials.SetSkipPasswordPrompt(acc.AccountName, !current);
+            _credentials.Save();
+            await LoadAllData();
+            ShowNotification(!current ? "Уведомления о пароле отключены" : "Уведомления о пароле включены");
         }
-    }
 
-    public class TextInputDialog : Window
-    {
-        public string InputText { get; private set; }
-        private TextBox textBox;
-
-        public TextInputDialog(string title, string defaultText)
+        private async Task ToggleFavorite()
         {
-            Title = title;
-            Width = 450;
-            Height = 220;
-            WindowStartupLocation = WindowStartupLocation.CenterScreen;
-            ResizeMode = ResizeMode.NoResize;
-            Background = Brushes.White;
+            if (_currentContextAccount == null) return;
 
-            var stackPanel = new StackPanel { Margin = new Thickness(15) };
-            stackPanel.Children.Add(new TextBlock { Text = "Введите описание:", Margin = new Thickness(0, 0, 0, 10), FontWeight = FontWeights.Bold });
-            textBox = new TextBox { Text = defaultText, Height = 80, TextWrapping = TextWrapping.Wrap, AcceptsReturn = true, VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
-            stackPanel.Children.Add(textBox);
+            var acc = _currentContextAccount;
+            var favorites = LoadFavorites();
 
-            var buttonPanel = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(0, 10, 0, 0) };
-            var okButton = new Button { Content = "Сохранить", Width = 100, Height = 35, Margin = new Thickness(5), Background = Brushes.LightGreen, FontWeight = FontWeights.Bold };
-            var cancelButton = new Button { Content = "Отмена", Width = 100, Height = 35, Margin = new Thickness(5) };
-            okButton.Click += (s, e) => { InputText = textBox.Text; DialogResult = true; };
-            cancelButton.Click += (s, e) => DialogResult = false;
+            if (favorites.Contains(acc.AccountName))
+            {
+                favorites.Remove(acc.AccountName);
+                ShowNotification($"Аккаунт {acc.AccountName} удален из избранного");
+            }
+            else
+            {
+                favorites.Add(acc.AccountName);
+                ShowNotification($"Аккаунт {acc.AccountName} добавлен в избранное");
+            }
 
-            buttonPanel.Children.Add(okButton);
-            buttonPanel.Children.Add(cancelButton);
-            stackPanel.Children.Add(buttonPanel);
-            Content = stackPanel;
-            Loaded += (s, e) => textBox.Focus();
+            SaveFavorites(favorites);
+            await LoadAllData();
         }
-    }
 
-    public class AddAccountDialog : Window
-    {
-        public event Action<string, string, string, string, string, bool> AccountCreated;
-        private TextBox loginBox, passwordBox, emailBox, emailPasswordBox, descriptionBox;
-        private CheckBox autoCopyCheckBox;
-        private Random random = new Random();
-
-        public AddAccountDialog()
+        private void SetSource(SteamAccount account)
         {
-            Title = "Добавление аккаунта";
-            Width = 520;
-            Height = 580;
-            WindowStartupLocation = WindowStartupLocation.CenterScreen;
-            ResizeMode = ResizeMode.NoResize;
-            Background = Brushes.White;
-
-            var scrollViewer = new ScrollViewer();
-            var stackPanel = new StackPanel { Margin = new Thickness(15) };
-
-            stackPanel.Children.Add(new TextBlock { Text = "Логин:", FontWeight = FontWeights.Bold, Margin = new Thickness(0, 5, 0, 5) });
-            loginBox = new TextBox { Height = 35, Margin = new Thickness(0, 0, 0, 10), FontSize = 12 };
-            stackPanel.Children.Add(loginBox);
-
-            stackPanel.Children.Add(new TextBlock { Text = "Пароль:", FontWeight = FontWeights.Bold, Margin = new Thickness(0, 5, 0, 5) });
-            var passwordPanel = new StackPanel { Orientation = Orientation.Horizontal };
-            passwordBox = new TextBox { Height = 35, Width = 380, Margin = new Thickness(0, 0, 5, 0), FontSize = 12 };
-            var genButton = new Button { Content = "🔑 Ген", Width = 70, Height = 35, FontWeight = FontWeights.Bold };
-            genButton.Click += (s, e) => passwordBox.Text = GeneratePassword();
-            passwordPanel.Children.Add(passwordBox);
-            passwordPanel.Children.Add(genButton);
-            stackPanel.Children.Add(passwordPanel);
-
-            stackPanel.Children.Add(new TextBlock { Text = "Email:", FontWeight = FontWeights.Bold, Margin = new Thickness(0, 10, 0, 5) });
-            emailBox = new TextBox { Height = 35, Margin = new Thickness(0, 0, 0, 10), FontSize = 12 };
-            stackPanel.Children.Add(emailBox);
-
-            stackPanel.Children.Add(new TextBlock { Text = "Пароль Email:", FontWeight = FontWeights.Bold, Margin = new Thickness(0, 5, 0, 5) });
-            emailPasswordBox = new TextBox { Height = 35, Margin = new Thickness(0, 0, 0, 10), FontSize = 12 };
-            stackPanel.Children.Add(emailPasswordBox);
-
-            stackPanel.Children.Add(new TextBlock { Text = "Описание:", FontWeight = FontWeights.Bold, Margin = new Thickness(0, 5, 0, 5) });
-            descriptionBox = new TextBox { Height = 60, TextWrapping = TextWrapping.Wrap, AcceptsReturn = true, Margin = new Thickness(0, 0, 0, 10), VerticalScrollBarVisibility = ScrollBarVisibility.Auto, FontSize = 12 };
-            stackPanel.Children.Add(descriptionBox);
-
-            autoCopyCheckBox = new CheckBox { Content = "Автокопировать конфиги", Margin = new Thickness(0, 5, 0, 15), FontSize = 12 };
-            stackPanel.Children.Add(autoCopyCheckBox);
-
-            var buttonPanel = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right };
-            var createButton = new Button { Content = "✓ Создать", Width = 100, Height = 35, Margin = new Thickness(5), Background = Brushes.LightGreen, FontWeight = FontWeights.Bold };
-            var cancelButton = new Button { Content = "✗ Отмена", Width = 100, Height = 35, Margin = new Thickness(5) };
-            createButton.Click += (s, e) => { if (string.IsNullOrEmpty(loginBox.Text)) { MessageBox.Show("Введите логин!"); return; } AccountCreated?.Invoke(loginBox.Text, passwordBox.Text, emailBox.Text, emailPasswordBox.Text, descriptionBox.Text, autoCopyCheckBox.IsChecked ?? false); DialogResult = true; };
-            cancelButton.Click += (s, e) => DialogResult = false;
-            buttonPanel.Children.Add(createButton);
-            buttonPanel.Children.Add(cancelButton);
-            stackPanel.Children.Add(buttonPanel);
-
-            scrollViewer.Content = stackPanel;
-            Content = scrollViewer;
-
-            loginBox.Text = "Player_" + random.Next(10000, 99999);
-            passwordBox.Text = GeneratePassword();
+            _sourceId = account.AccountId32;
+            StatusLabel.Text = $" | Источник: {_sourceId}";
+            ShowNotification($"Источник конфигов установлен: {account.AccountName}");
         }
 
-        private string GeneratePassword()
+        private void ApplySource(SteamAccount account)
         {
-            const string chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*";
-            char[] password = new char[12];
-            for (int i = 0; i < 12; i++) password[i] = chars[random.Next(chars.Length)];
-            return new string(password);
+            if (string.IsNullOrEmpty(_sourceId))
+            {
+                MessageBox.Show("Сначала выберите источник конфигов (кнопка 'ВЗЯТЬ КОНФИГИ')",
+                               "Ошибка", MessageBoxButton.OK, MessageBoxImage.Error);
+                return;
+            }
+
+            try
+            {
+                CopyConfigurations(_sourceId, account.AccountId32);
+                MessageBox.Show($"Настройки успешно скопированы в {account.AccountName}!",
+                               "Успех", MessageBoxButton.OK, MessageBoxImage.Information);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Ошибка копирования: {ex.Message}", "Ошибка",
+                               MessageBoxButton.OK, MessageBoxImage.Error);
+            }
         }
-    }
 
-    public class EditAccountDialog : Window
-    {
-        public event Action<string, string, string, string, string, bool, bool> AccountUpdated;
-        private TextBox loginBox, passwordBox, emailBox, emailPasswordBox, descriptionBox;
-        private CheckBox autoCopyCheckBox, skipPromptCheckBox;
-
-        public EditAccountDialog(string login, string password, string email, string emailPassword, string description, bool autoCopyConfig, bool skipPasswordPrompt)
+        private void OpenDatabase()
         {
-            Title = $"Редактирование {login}";
-            Width = 520;
-            Height = 630;
-            WindowStartupLocation = WindowStartupLocation.CenterScreen;
-            ResizeMode = ResizeMode.NoResize;
-            Background = Brushes.White;
-
-            var scrollViewer = new ScrollViewer();
-            var stackPanel = new StackPanel { Margin = new Thickness(15) };
-
-            stackPanel.Children.Add(new TextBlock { Text = "Логин:", FontWeight = FontWeights.Bold, Margin = new Thickness(0, 5, 0, 5) });
-            loginBox = new TextBox { Text = login, Height = 35, Margin = new Thickness(0, 0, 0, 10), IsEnabled = false, FontSize = 12 };
-            stackPanel.Children.Add(loginBox);
-
-            stackPanel.Children.Add(new TextBlock { Text = "Пароль:", FontWeight = FontWeights.Bold, Margin = new Thickness(0, 5, 0, 5) });
-            passwordBox = new TextBox { Text = password, Height = 35, Margin = new Thickness(0, 0, 0, 10), FontSize = 12 };
-            stackPanel.Children.Add(passwordBox);
-
-            stackPanel.Children.Add(new TextBlock { Text = "Email:", FontWeight = FontWeights.Bold, Margin = new Thickness(0, 10, 0, 5) });
-            emailBox = new TextBox { Text = email, Height = 35, Margin = new Thickness(0, 0, 0, 10), FontSize = 12 };
-            stackPanel.Children.Add(emailBox);
-
-            stackPanel.Children.Add(new TextBlock { Text = "Пароль Email:", FontWeight = FontWeights.Bold, Margin = new Thickness(0, 5, 0, 5) });
-            emailPasswordBox = new TextBox { Text = emailPassword, Height = 35, Margin = new Thickness(0, 0, 0, 10), FontSize = 12 };
-            stackPanel.Children.Add(emailPasswordBox);
-
-            stackPanel.Children.Add(new TextBlock { Text = "Описание:", FontWeight = FontWeights.Bold, Margin = new Thickness(0, 5, 0, 5) });
-            descriptionBox = new TextBox { Text = description, Height = 60, TextWrapping = TextWrapping.Wrap, AcceptsReturn = true, Margin = new Thickness(0, 0, 0, 10), VerticalScrollBarVisibility = ScrollBarVisibility.Auto, FontSize = 12 };
-            stackPanel.Children.Add(descriptionBox);
-
-            autoCopyCheckBox = new CheckBox { Content = "Автокопировать конфиги", IsChecked = autoCopyConfig, Margin = new Thickness(0, 5, 0, 10), FontSize = 12 };
-            stackPanel.Children.Add(autoCopyCheckBox);
-
-            skipPromptCheckBox = new CheckBox { Content = "Больше не спрашивать пароль", IsChecked = skipPasswordPrompt, Margin = new Thickness(0, 5, 0, 15), FontSize = 12 };
-            stackPanel.Children.Add(skipPromptCheckBox);
-
-            var buttonPanel = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right };
-            var saveButton = new Button { Content = "✓ Сохранить", Width = 100, Height = 35, Margin = new Thickness(5), Background = Brushes.LightGreen, FontWeight = FontWeights.Bold };
-            var cancelButton = new Button { Content = "✗ Отмена", Width = 100, Height = 35, Margin = new Thickness(5) };
-            saveButton.Click += (s, e) => { AccountUpdated?.Invoke(loginBox.Text, passwordBox.Text, emailBox.Text, emailPasswordBox.Text, descriptionBox.Text, autoCopyCheckBox.IsChecked ?? false, skipPromptCheckBox.IsChecked ?? false); DialogResult = true; };
-            cancelButton.Click += (s, e) => DialogResult = false;
-
-            buttonPanel.Children.Add(saveButton);
-            buttonPanel.Children.Add(cancelButton);
-            stackPanel.Children.Add(buttonPanel);
-
-            scrollViewer.Content = stackPanel;
-            Content = scrollViewer;
+            try
+            {
+                var path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SteamSwitcher");
+                Process.Start("explorer.exe", path);
+            }
+            catch (Exception ex)
+            {
+                _logger.Error("Ошибка открытия папки с данными", ex);
+                MessageBox.Show($"Не удалось открыть папку: {ex.Message}", "Ошибка", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
         }
-    }
 
-    public class NotificationWindow : Window
-    {
-        public NotificationWindow(string message)
+        private async void RefreshList()
         {
-            Title = "";
-            Width = 300;
-            Height = 50;
-            WindowStartupLocation = WindowStartupLocation.CenterScreen;
-            WindowStyle = WindowStyle.None;
-            Topmost = true;
-            Background = new SolidColorBrush(Color.FromRgb(42, 71, 94));
-            Opacity = 0.95;
-            ShowInTaskbar = false;
-
-            var textBlock = new TextBlock { Text = message, Foreground = Brushes.White, FontSize = 13, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center, FontWeight = FontWeights.Bold };
-            Content = textBlock;
-
-            Loaded += (s, e) => { Left = (SystemParameters.PrimaryScreenWidth - Width) / 2; Top = SystemParameters.PrimaryScreenHeight - Height - 50; };
+            await LoadAllData();
+            ShowNotification("Список обновлен!");
         }
+
+        private void ShowNotification(string message)
+        {
+            var notification = new NotificationWindow(message, this);
+            notification.Show();
+        }
+
+        private void BtnNewAccount_Click(object sender, RoutedEventArgs e) => OpenAddAccount();
+        private void BtnOpenDatabase_Click(object sender, RoutedEventArgs e) => OpenDatabase();
+        private void BtnRefresh_Click(object sender, RoutedEventArgs e) => RefreshList();
     }
 }

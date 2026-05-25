@@ -1,0 +1,103 @@
+﻿<Window x:Class="steamCenter.EditAccountDialog"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Редактирование аккаунта"
+        Height="600"
+        Width="450"
+        WindowStartupLocation="CenterOwner"
+        ResizeMode="NoResize"
+        Background="#1B2838">
+	<Grid Margin="15">
+		<Grid.RowDefinitions>
+			<RowDefinition Height="Auto"/>
+			<RowDefinition Height="Auto"/>
+			<RowDefinition Height="Auto"/>
+			<RowDefinition Height="Auto"/>
+			<RowDefinition Height="Auto"/>
+			<RowDefinition Height="Auto"/>
+			<RowDefinition Height="Auto"/>
+			<RowDefinition Height="Auto"/>
+			<RowDefinition Height="Auto"/>
+			<RowDefinition Height="Auto"/>
+			<RowDefinition Height="Auto"/>
+			<RowDefinition Height="Auto"/>
+			<RowDefinition Height="*"/>
+		</Grid.RowDefinitions>
+
+		<TextBlock Text="Логин Steam:"
+                   Foreground="White"
+                   Grid.Row="0"
+                   Margin="0,0,0,2"/>
+		<TextBox x:Name="LoginBox"
+                 Grid.Row="1"
+                 Height="25"
+                 IsReadOnly="True"
+                 Margin="0,0,0,10"/>
+
+		<TextBlock Text="Пароль Steam:"
+                   Foreground="White"
+                   Grid.Row="2"
+                   Margin="0,0,0,2"/>
+		<PasswordBox x:Name="PasswordBox"
+                     Grid.Row="3"
+                     Height="25"
+                     Margin="0,0,0,10"/>
+
+		<TextBlock Text="Email:"
+                   Foreground="White"
+                   Grid.Row="4"
+                   Margin="0,0,0,2"/>
+		<TextBox x:Name="EmailBox"
+                 Grid.Row="5"
+                 Height="25"
+                 Margin="0,0,0,10"/>
+
+		<TextBlock Text="Пароль Email:"
+                   Foreground="White"
+                   Grid.Row="6"
+                   Margin="0,0,0,2"/>
+		<PasswordBox x:Name="EmailPasswordBox"
+                     Grid.Row="7"
+                     Height="25"
+                     Margin="0,0,0,10"/>
+
+		<TextBlock Text="Описание:"
+                   Foreground="White"
+                   Grid.Row="8"
+                   Margin="0,0,0,2"/>
+		<TextBox x:Name="DescriptionBox"
+                 Grid.Row="9"
+                 Height="25"
+                 Margin="0,0,0,10"/>
+
+		<CheckBox x:Name="AutoCopyCheck"
+                  Grid.Row="10"
+                  Content="Автоматически копировать конфиги при входе"
+                  Foreground="White"
+                  Margin="0,0,0,5"/>
+
+		<CheckBox x:Name="SkipPasswordCheck"
+                  Grid.Row="11"
+                  Content="Больше не спрашивать пароль при входе"
+                  Foreground="White"
+                  Margin="0,0,0,15"/>
+
+		<StackPanel Grid.Row="12"
+                    Orientation="Horizontal"
+                    HorizontalAlignment="Right">
+			<Button Content="Сохранить"
+                    Width="85"
+                    Height="35"
+                    Background="#4CAF50"
+                    Foreground="White"
+                    Click="SaveButton_Click"
+                    Margin="0,0,10,0"/>
+			<Button Content="Отмена"
+                    Width="85"
+                    Height="35"
+                    Background="#f44336"
+                    Foreground="White"
+                    Click="CancelButton_Click"/>
+		</StackPanel>
+	</Grid>
+</Window>
