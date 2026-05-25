@@ -683,7 +683,90 @@ namespace steamCenter
         }
 
         /// <summary>
-        /// Установка AutoLoginUser в реестре для бесшовного входа
+        /// Обновление файла loginusers.vdf - устанавливаем MostRecent для нужного аккаунта
+        /// </summary>
+        private void UpdateLoginUsersVdf(string targetLogin)
+        {
+            string vdfPath = Path.Combine(_steamPath, "config", "loginusers.vdf");
+            if (!File.Exists(vdfPath))
+            {
+                _logger.Warning($"Файл loginusers.vdf не найден: {vdfPath}");
+                return;
+            }
+
+            try
+            {
+                // Снимаем атрибут "Только чтение"
+                var fileInfo = new FileInfo(vdfPath);
+                if (fileInfo.IsReadOnly)
+                {
+                    fileInfo.IsReadOnly = false;
+                    _logger.Info("Снят атрибут 'Только чтение' с loginusers.vdf");
+                }
+
+                string[] lines = File.ReadAllLines(vdfPath, Encoding.UTF8);
+                int currentBlockStartIndex = -1;
+                int targetBlockStartIndex = -1;
+
+                // Первый проход: ищем SteamID аккаунта с нужным логином
+                for (int i = 0; i < lines.Length; i++)
+                {
+                    string line = lines[i].Trim();
+
+                    // Каждый аккаунт начинается со строки SteamID64 (начинается с цифр и может быть в кавычках)
+                    if ((line.StartsWith("\"7656") || Regex.IsMatch(line, @"^\d+$")) && i + 1 < lines.Length && lines[i + 1].Contains("{"))
+                    {
+                        currentBlockStartIndex = i;
+                    }
+
+                    // Если внутри этого блока нашли наш логин (без учета регистра)
+                    if (line.Contains("AccountName") && line.ToLower().Contains(targetLogin.ToLower()))
+                    {
+                        targetBlockStartIndex = currentBlockStartIndex;
+                        _logger.Info($"Найден блок аккаунта для {targetLogin} на индексе {targetBlockStartIndex}");
+                    }
+                }
+
+                // Второй проход: устанавливаем MostRecent
+                currentBlockStartIndex = -1;
+                for (int i = 0; i < lines.Length; i++)
+                {
+                    string line = lines[i].Trim();
+
+                    if ((line.StartsWith("\"7656") || Regex.IsMatch(line, @"^\d+$")) && i + 1 < lines.Length && lines[i + 1].Contains("{"))
+                    {
+                        currentBlockStartIndex = i;
+                    }
+
+                    if (line.Contains("MostRecent"))
+                    {
+                        if (currentBlockStartIndex == targetBlockStartIndex && targetBlockStartIndex != -1)
+                        {
+                            // Наш целевой аккаунт делаем самым активным
+                            lines[i] = Regex.Replace(lines[i], "\"MostRecent\"\\s+\"\\d+\"", "\"MostRecent\"\t\t\"1\"");
+                            _logger.Info($"Установлен MostRecent=1 для аккаунта {targetLogin}");
+                        }
+                        else if (currentBlockStartIndex != -1)
+                        {
+                            // У остальных аккаунтов сбрасываем флаг
+                            lines[i] = Regex.Replace(lines[i], "\"MostRecent\"\\s+\"\\d+\"", "\"MostRecent\"\t\t\"0\"");
+                        }
+                    }
+                }
+
+                // Сохраняем изменения
+                File.WriteAllLines(vdfPath, lines, Encoding.UTF8);
+                _logger.Info("Файл loginusers.vdf успешно обновлен");
+            }
+            catch (Exception ex)
+            {
+                _logger.Error("Ошибка обновления loginusers.vdf", ex);
+                // Не выбрасываем исключение, чтобы продолжить работу даже если VDF не обновился
+            }
+        }
+
+        /// <summary>
+        /// Установка AutoLoginUser в реестре
         /// </summary>
         private void SetAutoLoginUser(string accountName)
         {
@@ -711,7 +794,7 @@ namespace steamCenter
         }
 
         /// <summary>
-        /// Запуск Steam без аргументов (он сам прочитает реестр)
+        /// Запуск Steam без аргументов
         /// </summary>
         private void StartSteam()
         {
@@ -726,8 +809,7 @@ namespace steamCenter
                 var processInfo = new ProcessStartInfo
                 {
                     FileName = steamExe,
-                    UseShellExecute = true,
-                    Verb = "runas" // Запуск с правами администратора если нужно
+                    UseShellExecute = true
                 };
 
                 Process.Start(processInfo);
@@ -741,7 +823,7 @@ namespace steamCenter
         }
 
         /// <summary>
-        /// Бесшовный вход в аккаунт через реестр (без окон Steam)
+        /// Бесшовный вход в аккаунт через реестр и VDF файл
         /// </summary>
         private void LoginAccount(SteamAccount account)
         {
@@ -770,21 +852,25 @@ namespace steamCenter
                 // 3. Останавливаем все процессы Steam
                 KillSteamProcesses();
 
-                // 4. Устанавливаем AutoLoginUser в реестре
+                // 4. Обновляем VDF файл (устанавливаем MostRecent)
+                StatusLabel.Text = "Обновление конфигурации Steam...";
+                UpdateLoginUsersVdf(account.AccountName);
+
+                // 5. Устанавливаем AutoLoginUser в реестре
                 StatusLabel.Text = "Настройка автоматического входа...";
                 SetAutoLoginUser(account.AccountName);
 
-                // 5. Запускаем Steam без аргументов
+                // 6. Запускаем Steam без аргументов
                 StatusLabel.Text = "Запуск Steam...";
                 StartSteam();
 
-                // 6. Обновляем время последнего входа
+                // 7. Обновляем время последнего входа
                 account.LastLogin = DateTime.Now;
 
-                // 7. Показываем уведомление
+                // 8. Показываем уведомление
                 ShowNotification($"Вход в {account.AccountName} выполнен успешно!");
 
-                // 8. Обновляем список (чтобы показать новое время)
+                // 9. Обновляем список (чтобы показать новое время)
                 UpdateAccountsList();
 
                 StatusLabel.Text = $"Steam запущен с аккаунтом: {account.AccountName}";
